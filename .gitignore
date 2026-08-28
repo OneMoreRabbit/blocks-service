@@ -1,0 +1,2 @@
+# seeded by the orchestrator (Blocks Wave 1); the component seat owns real entries.
+# Atlas wiring (atlas_init) appends its own ignore block on seat onboarding.
