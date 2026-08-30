@@ -39,6 +39,21 @@ Run it:
 `GET /health/ready` reports `tenant_isolation: enforced` only if the connected
 role can neither bypass RLS nor own the tables.
 
+## Backup and restore
+
+`tools/restore_drill.py` dumps the database, restores it into a scratch copy, and
+verifies that **row-level security survived the round trip** — not just the rows.
+A restore that returns every row while silently losing RLS looks like a complete
+success and is a total tenant-isolation failure.
+
+```sh
+.venv/bin/python tools/restore_drill.py --source-db blocks --scratch-db blocks_drill
+```
+
+It needs `pg_dump` and `pg_restore` on `PATH`, which are **not yet part of the
+seat image** (`sudo apt-get install postgresql-client`). The drill's tests skip
+with a reason when they are missing.
+
 ## The one thing to know before changing anything
 
 Tenant isolation is enforced by PostgreSQL, not by this code. Every tenant-scoped
