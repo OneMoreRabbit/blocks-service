@@ -1,0 +1,24 @@
+# AGENTS.md — Atlas hook
+
+This repo is the **blocks-service** component of Blocks, governed by Architecture-Above-Code.
+The architecture lives in the project's Atlas vault — a git repo resolved by
+`scripts/atlas-sync.sh` into `$ATLAS_VAULT` (default `./.atlas`), at the method version
+pinned in the vault's `registry/io-graph.yml`. Never reference the vault by a machine path.
+
+**Before working:** read `ATLAS-CONTEXT.md` — injected by the SessionStart hook on every
+session start (including resume, `/clear`, compaction and fork). Regenerate any time with
+`sh scripts/atlas-context.sh`. **If it is absent, your hooks are not live** — the write
+guard is not running either. Fix the install (`atlas_init --launch-dir`, then `--verify`);
+until then honour the write scope by hand. It is your complete reading list: constitution, pinned
+upstream contracts, consumers' needs, in-flight proposals, drift. Consult the wider vault
+only if the context is insufficient — and treat that as a defect in the vault's
+`registry/io-graph.yml`: fix the graph, don't browse.
+
+**While working:** you may write only to `components/blocks-service/**`, an additive
+`architecture/proposals/NNNN-*.md`, and edges in `registry/io-graph.yml` that name you.
+A `PreToolUse` guard refuses anything else. That is not an obstacle to route around: if you
+need something owned elsewhere, ask for it in `components/blocks-service/docs/needs/`.
+
+**After working:** run `/atlas-publish` (contracts to provides/, asks to needs/, ADRs for
+shared changes, bump `updated:`, recompile as a check, commit authored files only on
+`atlas/blocks-service/<topic>`, open the PR).
