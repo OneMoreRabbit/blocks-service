@@ -4,3 +4,13 @@
 .atlas/
 .atlas-method/
 ATLAS-CONTEXT.md
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Local configuration and secrets — never committed.
+.env

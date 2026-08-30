@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-created-v0_1.schema.json",
+  "title": "project.created 0.1",
+  "description": "Payload of a `project.created` event. Carries identifiers and the state at creation; it is a notification, not a replacement for reading the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["projectId", "name"],
+  "properties": {
+    "projectId": { "type": "string", "format": "uuid" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 }
+  }
+}

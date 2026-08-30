@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/blocks-event-envelope-v0_1.schema.json",
+  "title": "Blocks event envelope 0.1",
+  "description": "The wrapper every Blocks domain event is delivered in. Assembled by the dispatcher from an outbox row; consumers match on eventType and branch on eventVersion.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "eventVersion", "tenantId", "occurredAt", "payload"],
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "description": "Monotonic per deployment. Stable across redeliveries, so consumers can deduplicate.",
+      "pattern": "^[0-9]+$"
+    },
+    "eventType": {
+      "type": "string",
+      "description": "Dotted name, e.g. `project.created`. Additive: a new type is a MINOR change.",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "eventVersion": {
+      "type": "string",
+      "description": "MAJOR.MINOR of the payload schema for this eventType, stamped when the event was written -- not when it was delivered.",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "tenantId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Every event belongs to exactly one tenant. There are no cross-tenant events."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the originating transaction committed, not when the event was dispatched."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Shape determined by eventType and eventVersion."
+    }
+  }
+}
