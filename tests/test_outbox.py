@@ -90,7 +90,7 @@ async def test_a_failed_project_creation_leaves_no_event(client, auth, db: Datab
         headers=auth("alice"),
         json={"name": ""},
     )
-    assert rejected.status_code == 422
+    assert rejected.status_code == 400
 
     async with db.tenant_transaction(alice["personal_tenant_id"], alice["user_id"]) as conn:
         cur = await conn.execute("select id from blocks.outbox")
