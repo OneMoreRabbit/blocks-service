@@ -69,6 +69,31 @@ def dsn_to_args(dsn: str) -> tuple[list[str], dict]:
     return args, env
 
 
+def assert_can_dump(dsn: str) -> None:
+    """A logical dump of this schema needs a role exempt from RLS. Check first.
+
+    `pg_dump` sets `row_security = off` and errors if any table it reads is under
+    a policy the role is subject to -- correct behaviour, because the alternative
+    is a partial dump that looks complete.
+
+    Do NOT "fix" that error with `--enable-row-security`. Measured on this schema:
+    it exits 0, `pg_restore` exits 0, and every tenant-scoped table comes back
+    EMPTY while the un-policied identity tables restore normally. A backup that
+    succeeds and silently contains no tenant data is the worst available outcome.
+    """
+    with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
+        row = conn.execute(
+            "select rolsuper, rolbypassrls from pg_roles where rolname = current_user"
+        ).fetchone()
+    if not row or not (row["rolsuper"] or row["rolbypassrls"]):
+        raise DrillFailure(
+            "the dumping role cannot bypass row-level security, so pg_dump cannot "
+            "produce a complete dump of this schema. Use a dedicated backup role "
+            "with BYPASSRLS, or a physical backup. Do NOT add --enable-row-security: "
+            "it exits 0 and silently omits every tenant-scoped row."
+        )
+
+
 def snapshot(dsn: str) -> dict:
     """The facts a restore must preserve, security first."""
     with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
@@ -89,9 +114,25 @@ def snapshot(dsn: str) -> dict:
             " where table_schema = 'blocks' and grantee = 'blocks_app'"
             " order by table_name, privilege_type"
         ).fetchall()
+        # Row counts have to be taken per tenant now. No role in the estate can
+        # bypass RLS -- deliberately -- so there is no connection from which a
+        # global count of a tenant-scoped table is even meaningful: it would
+        # read 0 and compare equal to another 0, and prove nothing.
         counts = {}
-        for table in ("users", "tenants", *TENANT_TABLES):
+        for table in ("users", "tenants"):  # identity plane, no RLS
             counts[table] = conn.execute(f"select count(*) as n from blocks.{table}").fetchone()["n"]
+        tenant_ids = [
+            r["id"] for r in conn.execute("select id from blocks.tenants order by id").fetchall()
+        ]
+        for tenant_id in tenant_ids:
+            with conn.transaction():
+                conn.execute(
+                    "select set_config('blocks.tenant_id', %s, true)", (str(tenant_id),)
+                )
+                for table in TENANT_TABLES:
+                    counts[f"{table}@{tenant_id}"] = conn.execute(
+                        f"select count(*) as n from blocks.{table}"
+                    ).fetchone()["n"]
     return {
         "migrations": [tuple(r.values()) for r in migrations],
         "rls": {r["relname"]: (r["relrowsecurity"], r["relforcerowsecurity"]) for r in rls},
@@ -168,7 +209,11 @@ def compare(before: dict, after: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--admin-dsn", default=os.environ.get("BLOCKS_ADMIN_DSN"))
+    parser.add_argument(
+        "--admin-dsn",
+        default=os.environ.get("BLOCKS_TEST_ADMIN_DSN") or os.environ.get("BLOCKS_ADMIN_DSN"),
+        help="a CREATEDB role that owns the scratch database; NOT a superuser",
+    )
     parser.add_argument("--source-db", default=os.environ.get("BLOCKS_DB_NAME", "blocks"))
     parser.add_argument("--scratch-db", default="blocks_drill")
     parser.add_argument("--app-user", default=os.environ.get("BLOCKS_DB_APP_USER", "blocks_app"))
@@ -177,7 +222,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.admin_dsn:
-        print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
+        print("BLOCKS_TEST_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
         return 2
 
     source_dsn = swap_db(args.admin_dsn, args.source_db)
@@ -186,6 +231,7 @@ def main() -> int:
 
     try:
         print(f"drill: {args.source_db} -> {args.scratch_db}")
+        assert_can_dump(source_dsn)
         before = snapshot(source_dsn)
 
         with tempfile.TemporaryDirectory() as tmp:

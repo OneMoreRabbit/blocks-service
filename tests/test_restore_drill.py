@@ -21,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 from blocks_service.app import create_app
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCRATCH = "blocks_test_drill"
+SCRATCH = "blocks_service_test_drill"
 
 
 def _load_drill():
@@ -44,7 +44,30 @@ requires_pg_client = pytest.mark.skipif(
     reason="pg_dump/pg_restore not installed; see the seat-tooling need in the Atlas vault",
 )
 
-pytestmark = [requires_pg_client]
+def _dump_role_can_bypass_rls() -> bool:
+    from tests.conftest import ADMIN_DSN
+
+    try:
+        with psycopg.connect(ADMIN_DSN, connect_timeout=5, autocommit=True) as conn:
+            row = conn.execute(
+                "select rolsuper or rolbypassrls as ok from pg_roles where rolname = current_user"
+            ).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+#: pg_dump cannot dump FORCE RLS tables as a role subject to those policies, so
+#: the drill needs a role exempt from them. Since the estate rotated its
+#: superuser away there is no such role reachable from this seat -- see the
+#: backup-role need in the Atlas vault. Skipped rather than silently weakened:
+#: the alternative, --enable-row-security, exits 0 and dumps no tenant rows.
+requires_dump_capable_role = pytest.mark.skipif(
+    not _dump_role_can_bypass_rls(),
+    reason="dumping role cannot bypass RLS; pg_dump cannot dump this schema — see the backup-role need",
+)
+
+pytestmark = [requires_pg_client, requires_dump_capable_role]
 
 
 @pytest.fixture(autouse=True)

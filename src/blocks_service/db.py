@@ -74,12 +74,7 @@ class Database:
                 "select rolsuper, rolbypassrls from pg_roles where rolname = current_user"
             )
             row = await cur.fetchone()
-        if row is None:
-            raise RlsBypassError("runtime role not found in pg_roles")
-        if row["rolsuper"] or row["rolbypassrls"]:
-            raise RlsBypassError(
-                "runtime role has SUPERUSER or BYPASSRLS; tenant isolation is not enforced"
-            )
+        assert_role_cannot_bypass(row)
 
     async def ping(self) -> None:
         async with self._pool.connection() as conn:
@@ -103,3 +98,20 @@ async def set_transaction_context(
         "       set_config('blocks.user_id',   %s, true)",
         (str(tenant_id), str(actor_id)),
     )
+
+
+def assert_role_cannot_bypass(row: dict | None) -> None:
+    """Raise unless the role described by `row` is subject to row-level security.
+
+    Split out from the query so the decision can be tested directly. Since the
+    estate rotated its superuser away, no role reachable from this service can
+    bypass RLS -- which is the point, and also means the negative case has no
+    live role left to exercise it. A guard whose failure path is untested is a
+    guard nobody has seen work.
+    """
+    if row is None:
+        raise RlsBypassError("runtime role not found in pg_roles")
+    if row["rolsuper"] or row["rolbypassrls"]:
+        raise RlsBypassError(
+            "runtime role has SUPERUSER or BYPASSRLS; tenant isolation is not enforced"
+        )

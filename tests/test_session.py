@@ -41,8 +41,11 @@ async def test_a_user_cannot_have_a_second_personal_tenant(client, auth, setting
     would still hold in these tests while failing under any second writer.
     """
     await client.post("/v1/session", headers=auth("alice"))
-    dsn = settings.dsn(user="blocks", password="blocks-dev")
+    from tests.conftest import ADMIN_DSN, _swap_dbname
+
+    dsn = _swap_dbname(ADMIN_DSN, settings.db_name)
     with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
         user_id = conn.execute(
             "select id from blocks.users where subject = 'alice'"
         ).fetchone()[0]

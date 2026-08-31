@@ -25,10 +25,14 @@ Requires the seat's platform PostgreSQL container (`postgres:5432`).
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 cp .env.example .env
-export BLOCKS_ADMIN_DSN="host=postgres port=5432 user=blocks password=blocks-dev dbname=blocks"
-.venv/bin/python tools/dev_db.py      # roles, then migrations
 .venv/bin/python -m pytest
 ```
+
+The harness connects as `blocks_test_admin` (CREATEDB, **not** a superuser) and
+reads its password from `~/.secrets/blocks_test_admin_password`, delivered
+seat-locally. Roles themselves are cluster-level and provisioned by the
+orchestrator from `tools/bootstrap_roles.sql`; a seat has no `CREATEROLE`, so use
+`tools/dev_db.py --migrations-only` to apply migrations alone.
 
 Run it:
 
@@ -50,9 +54,16 @@ success and is a total tenant-isolation failure.
 .venv/bin/python tools/restore_drill.py --source-db blocks --scratch-db blocks_drill
 ```
 
-It needs `pg_dump` and `pg_restore` on `PATH`, which are **not yet part of the
-seat image** (`sudo apt-get install postgresql-client`). The drill's tests skip
-with a reason when they are missing.
+It needs `pg_dump`/`pg_restore` on `PATH` (not yet in the seat image) **and** a
+role that can bypass RLS. There is currently no such role reachable from a seat,
+so the drill's tests skip with a reason.
+
+That second requirement is not a quirk. `pg_dump` refuses to dump a table whose
+policies apply to the dumping role, because the alternative is a partial dump
+that looks complete. **Never silence that with `--enable-row-security`**:
+measured on this schema, it exits 0, `pg_restore` exits 0, and every
+tenant-scoped table comes back empty while the un-policied identity tables
+restore normally.
 
 ## The one thing to know before changing anything
 

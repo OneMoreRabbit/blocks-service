@@ -26,10 +26,37 @@ from blocks_service.config import Environment, IdentityMode, Settings  # noqa: E
 from blocks_service.db import Database  # noqa: E402
 from blocks_service.identity import DevVerifier  # noqa: E402
 
-TEST_DB = os.environ.get("BLOCKS_TEST_DB", "blocks_test")
-ADMIN_DSN = os.environ.get(
-    "BLOCKS_ADMIN_DSN", "host=postgres port=5432 user=blocks password=blocks-dev dbname=blocks"
-)
+TEST_DB = os.environ.get("BLOCKS_TEST_DB", "blocks_service_test")
+
+#: The harness runs as blocks_test_admin, NOT as a superuser.
+#:
+#: This suite exists to prove tenant isolation, so it must not run as a role that
+#: is exempt from it -- a superuser harness can make a broken policy look fine.
+#: blocks_test_admin is CREATEDB, NOSUPERUSER, NOBYPASSRLS and a member of
+#: blocks_owner: enough to build and tear down test databases, and still subject
+#: to every policy under test.
+#:
+#: Its password is delivered seat-locally by the orchestrator and is deliberately
+#: not in this repository, this vault, or the environment defaults.
+TEST_ADMIN_SECRET = pathlib.Path.home() / ".secrets" / "blocks_test_admin_password"
+
+
+def _test_admin_dsn() -> str:
+    if dsn := os.environ.get("BLOCKS_TEST_ADMIN_DSN"):
+        return dsn
+    if not TEST_ADMIN_SECRET.exists():
+        raise RuntimeError(
+            f"no blocks_test_admin password at {TEST_ADMIN_SECRET} and no "
+            "BLOCKS_TEST_ADMIN_DSN set. The superuser this harness used to rely on "
+            "was rotated out of the vault; see the database-exposure need."
+        )
+    password = TEST_ADMIN_SECRET.read_text().strip()
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    return f"host={host} port={port} user=blocks_test_admin password={password} dbname=blocks"
+
+
+ADMIN_DSN = _test_admin_dsn()
 MIGRATOR_PASSWORD = os.environ.get("BLOCKS_DB_MIGRATOR_PASSWORD", "blocks-dev-migrator")
 APP_PASSWORD = os.environ.get("BLOCKS_DB_APP_PASSWORD", "blocks-dev-app")
 DEV_SECRET = "test-signing-key-not-a-secret-32b+"
@@ -41,10 +68,24 @@ def settings() -> Settings:
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute(f'drop database if exists "{TEST_DB}" with (force)')
         conn.execute(f'create database "{TEST_DB}"')
+        # Database-level grants are not cluster globals and do not come with the
+        # roles: a freshly created database grants CONNECT/CREATE to nobody. Role
+        # bootstrap used to do this, but that needs CREATEROLE, which no seat has.
+        conn.execute(
+            f'grant connect on database "{TEST_DB}"'
+            " to blocks_owner, blocks_migrator, blocks_app"
+        )
+        conn.execute(f'grant create on database "{TEST_DB}" to blocks_owner')
 
     admin_test_dsn = _swap_dbname(ADMIN_DSN, TEST_DB)
     result = subprocess.run(
-        [sys.executable, str(ROOT / "tools" / "dev_db.py"), "--admin-dsn", admin_test_dsn],
+        [
+            sys.executable, str(ROOT / "tools" / "dev_db.py"),
+            "--admin-dsn", admin_test_dsn,
+            # Roles are cluster-level and provisioned by the orchestrator from
+            # bootstrap_roles.sql. The harness has no CREATEROLE and needs none.
+            "--migrations-only",
+        ],
         env={
             **os.environ,
             "BLOCKS_DB_NAME": TEST_DB,
@@ -82,6 +123,9 @@ def clean_tables(settings: Settings) -> Iterator[None]:
     """
     yield
     with psycopg.connect(_swap_dbname(ADMIN_DSN, TEST_DB), autocommit=True) as conn:
+        # TRUNCATE is an owner privilege. blocks_test_admin holds it only through
+        # membership of blocks_owner, so it has to ask for it explicitly.
+        conn.execute("set role blocks_owner")
         conn.execute(
             "truncate blocks.outbox, blocks.projects, blocks.memberships,"
             " blocks.tenants, blocks.users cascade"

@@ -6,9 +6,9 @@ psql -- and then the migrations. It exists so a seat with no psql client can
 still reach a byte-identical database, and so bootstrap_roles.sql has exactly one
 home rather than a Python paraphrase that can drift from it.
 
-Requires an administrative DSN (BLOCKS_ADMIN_DSN). Development only: it never
-runs against, and never needs to run against, a deployed environment, where the
-orchestrator owns role provisioning.
+Role bootstrap needs CREATEROLE, which no Blocks seat has and none should: roles
+are cluster-level and the orchestrator provisions them from the same
+bootstrap_roles.sql. Pass --migrations-only on a seat.
 """
 
 from __future__ import annotations
@@ -57,11 +57,19 @@ def main() -> int:
     parser.add_argument("--app-password", default=os.environ.get("BLOCKS_DB_APP_PASSWORD", "blocks-dev-app"))
     parser.add_argument("--database", default=os.environ.get("BLOCKS_DB_NAME", "blocks"))
     parser.add_argument("--roles-only", action="store_true")
+    parser.add_argument(
+        "--migrations-only",
+        action="store_true",
+        help="skip role bootstrap (roles are the orchestrator's; a seat has no CREATEROLE)",
+    )
     args = parser.parse_args()
 
     if not args.admin_dsn:
         print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
         return 2
+
+    if args.migrations_only:
+        return _migrate(args)
 
     statements = render(
         ROLES_SQL.read_text(),
@@ -71,13 +79,25 @@ def main() -> int:
             "db": args.database,
         },
     )
-    with psycopg.connect(args.admin_dsn, autocommit=True) as conn:
-        conn.execute(statements)
+    try:
+        with psycopg.connect(args.admin_dsn, autocommit=True) as conn:
+            conn.execute(statements)
+    except psycopg.errors.InsufficientPrivilege:
+        print(
+            "role bootstrap needs CREATEROLE, which no Blocks seat has.\n"
+            "Roles are provisioned by the orchestrator from tools/bootstrap_roles.sql;\n"
+            "use --migrations-only here, or run this file through psql as an admin.",
+            file=sys.stderr,
+        )
+        return 2
     print(f"roles ready in database {args.database}")
 
     if args.roles_only:
         return 0
+    return _migrate(args)
 
+
+def _migrate(args) -> int:
     env = {
         **os.environ,
         "BLOCKS_DB_MIGRATOR_PASSWORD": args.migrator_password,

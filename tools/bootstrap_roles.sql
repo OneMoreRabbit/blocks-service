@@ -13,9 +13,18 @@
 --                    blocks_owner so new objects belong to the owner, not to it.
 --   blocks_app       LOGIN, NOSUPERUSER, NOBYPASSRLS. DML only. This is the role
 --                    the service runs as, and it is subject to every policy.
+--   blocks_test_admin LOGIN CREATEDB, NOSUPERUSER, NOBYPASSRLS, member of
+--                    blocks_owner. Development and CI only: it creates and drops
+--                    test databases and truncates between tests. Deliberately NOT
+--                    a superuser -- the test suite exists to prove tenant
+--                    isolation, so it must not run as something exempt from it.
 --
 -- Passwords are supplied by the caller via psql variables; none are baked in.
---   psql -v owner_pw=... -v migrator_pw=... -v app_pw=... -f tools/bootstrap_roles.sql
+--   psql -v migrator_pw=... -v app_pw=... -v test_admin_pw=... -v db=blocks \
+--        -f tools/bootstrap_roles.sql
+--
+-- blocks_test_admin is a development/CI role. Omit it in production by passing an
+-- unused password and revoking CONNECT, or drop the role after bootstrap.
 
 \set ON_ERROR_STOP on
 
@@ -30,6 +39,9 @@ begin
   if not exists (select 1 from pg_roles where rolname = 'blocks_app') then
     create role blocks_app login nosuperuser nobypassrls noinherit;
   end if;
+  if not exists (select 1 from pg_roles where rolname = 'blocks_test_admin') then
+    create role blocks_test_admin login createdb nosuperuser nobypassrls in role blocks_owner;
+  end if;
 end
 $$;
 
@@ -37,11 +49,13 @@ $$;
 -- silently disable tenant isolation, so this is not a create-time-only concern.
 alter role blocks_app nosuperuser nobypassrls nocreatedb nocreaterole;
 alter role blocks_owner nosuperuser nobypassrls;
+alter role blocks_test_admin createdb nosuperuser nobypassrls nocreaterole;
 
-alter role blocks_migrator password :'migrator_pw';
-alter role blocks_app      password :'app_pw';
+alter role blocks_migrator  password :'migrator_pw';
+alter role blocks_app       password :'app_pw';
+alter role blocks_test_admin password :'test_admin_pw';
 
-grant connect on database :"db" to blocks_owner, blocks_migrator, blocks_app;
+grant connect on database :"db" to blocks_owner, blocks_migrator, blocks_app, blocks_test_admin;
 
 -- blocks_owner creates the schema, so it needs CREATE on the database. blocks_app
 -- pointedly does not: the runtime role cannot introduce an object that would sit
