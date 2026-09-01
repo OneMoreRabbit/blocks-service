@@ -426,8 +426,44 @@ async def close_session(
     session_id: UUID,
     expected_version: int,
     outcome_tier: str | None = None,
+    interruption: str | None = None,
 ) -> dict:
+    """Close a session and record what it measured.
+
+    The calibration event is written in the same transaction as the close. Not
+    for durability theatre -- because evidence gathered later is evidence
+    reconstructed, and invariant 8 only works if the numbers are observations
+    rather than reconstructions.
+    """
     session = await _transition(conn, session_id, expected_version, "closed", stamp="closed_at")
+
+    cur = await conn.execute(
+        "update blocks.work_sessions set outcome_tier = %s, interruption = %s"
+        " where id = %s"
+        " returning started_at, closed_at, parked_at, resumed_at,"
+        "           full_outcome, polish_outcome",
+        (outcome_tier, interruption or "boundary", session_id),
+    )
+    detail = await cur.fetchone()
+    assert detail is not None
+
+    # The highest tier the session actually committed to, which is what
+    # "planned versus actual" has to compare against to mean anything.
+    planned = "polish" if detail["polish_outcome"] else ("full" if detail["full_outcome"] else "core")
+    elapsed = int((detail["closed_at"] - detail["started_at"]).total_seconds())
+    latency = None
+    if detail["parked_at"] and detail["resumed_at"] and detail["resumed_at"] > detail["parked_at"]:
+        latency = int((detail["resumed_at"] - detail["parked_at"]).total_seconds())
+
+    await conn.execute(
+        "insert into blocks.calibration_events"
+        " (tenant_id, work_session_id, planned_tier, actual_tier, elapsed_seconds,"
+        "  interruption, restart_latency_seconds)"
+        " values (%s, %s, %s, %s, %s, %s, %s)",
+        (tenant_id, session_id, planned, outcome_tier, elapsed,
+         interruption or "boundary", latency),
+    )
+
     await events.emit(
         conn,
         tenant_id=tenant_id,
@@ -435,6 +471,110 @@ async def close_session(
         payload={"sessionId": str(session_id), "outcomeTier": outcome_tier},
     )
     return session
+
+
+async def calibration_for_session(conn: psycopg.AsyncConnection, session_id: UUID) -> list[dict]:
+    cur = await conn.execute(
+        "select id, planned_tier::text as planned_tier, actual_tier::text as actual_tier,"
+        "       elapsed_seconds, interruption::text as interruption,"
+        "       restart_latency_seconds, created_at"
+        " from blocks.calibration_events where work_session_id = %s order by created_at",
+        (session_id,),
+    )
+    return list(await cur.fetchall())
+
+
+async def calibration_for_tenant(conn: psycopg.AsyncConnection, limit: int = 100) -> list[dict]:
+    """Raw observations, newest first.
+
+    Deliberately returns rows and no aggregate. There is no completion rate here,
+    no streak, and no total, because invariant 8 forbids presenting these as a
+    score and the cheapest way to honour that is to have nothing to present.
+    """
+    cur = await conn.execute(
+        "select id, work_session_id, planned_tier::text as planned_tier,"
+        "       actual_tier::text as actual_tier, elapsed_seconds,"
+        "       interruption::text as interruption, restart_latency_seconds, created_at"
+        " from blocks.calibration_events order by created_at desc limit %s",
+        (limit,),
+    )
+    return list(await cur.fetchall())
+
+
+# ---------------------------------------------------------------------------
+# Map dependencies
+# ---------------------------------------------------------------------------
+
+
+async def list_dependencies(conn: psycopg.AsyncConnection, project_id: UUID) -> list[dict]:
+    cur = await conn.execute(
+        "select d.predecessor_id, d.successor_id from blocks.map_dependencies d"
+        " join blocks.map_items p on p.id = d.predecessor_id"
+        " where p.project_id = %s order by d.predecessor_id, d.successor_id",
+        (project_id,),
+    )
+    return list(await cur.fetchall())
+
+
+async def add_dependency(
+    conn: psycopg.AsyncConnection, tenant_id: UUID, predecessor_id: UUID, successor_id: UUID
+) -> dict:
+    """Link two milestones, refusing anything that would create a cycle.
+
+    Self-dependency is caught by a check constraint; longer cycles cannot be, so
+    they are caught here with a reachability walk. A cycle in a map is not a
+    validation nicety -- it is a map that can never be ordered, which is the one
+    thing the map has to be.
+    """
+    cur = await conn.execute(
+        "select project_id from blocks.map_items where id = any(%s)",
+        ([predecessor_id, successor_id],),
+    )
+    projects = {row["project_id"] for row in await cur.fetchall()}
+    if len(projects) != 1:
+        raise NotFound("both items must exist, in the same project, in this tenant")
+
+    # Would the successor already reach the predecessor? If so, adding this edge
+    # closes a loop.
+    cur = await conn.execute(
+        "with recursive reachable(id) as ("
+        "   select successor_id from blocks.map_dependencies where predecessor_id = %s"
+        "   union"
+        "   select d.successor_id from blocks.map_dependencies d"
+        "     join reachable r on r.id = d.predecessor_id"
+        ") select 1 from reachable where id = %s limit 1",
+        (successor_id, predecessor_id),
+    )
+    if await cur.fetchone() is not None:
+        raise IllegalTransition(
+            "that dependency would create a cycle; the map must stay orderable"
+        )
+
+    try:
+        cur = await conn.execute(
+            "insert into blocks.map_dependencies (tenant_id, predecessor_id, successor_id)"
+            " values (%s, %s, %s) returning predecessor_id, successor_id",
+            (tenant_id, predecessor_id, successor_id),
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        raise IllegalTransition("that dependency already exists") from exc
+    except psycopg.errors.CheckViolation as exc:
+        raise IllegalTransition("a milestone cannot depend on itself") from exc
+    row = await cur.fetchone()
+    assert row is not None
+    return row
+
+
+async def remove_dependency(
+    conn: psycopg.AsyncConnection, predecessor_id: UUID, successor_id: UUID
+) -> None:
+    cur = await conn.execute(
+        "delete from blocks.map_dependencies"
+        " where predecessor_id = %s and successor_id = %s",
+        (predecessor_id, successor_id),
+    )
+    if cur.rowcount == 0:
+        raise NotFound("no such dependency in this tenant")
 
 
 async def newest_parking(conn: psycopg.AsyncConnection, session_id: UUID) -> dict | None:

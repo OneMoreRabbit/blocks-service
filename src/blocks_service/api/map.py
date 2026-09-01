@@ -80,3 +80,64 @@ async def update_item(
     except loop.DomainError as exc:
         raise as_http(exc) from exc
     return MapItemOut(**row)
+
+
+class DependencyIn(BaseModel):
+    predecessor_id: UUID
+    successor_id: UUID
+
+
+class DependencyOut(BaseModel):
+    predecessor_id: UUID
+    successor_id: UUID
+
+
+@router.get(
+    "/dependencies", response_model=list[DependencyOut], summary="Read the map's dependencies"
+)
+async def read_dependencies(
+    project_id: UUID, ctx: TenantContext = Depends(tenant_context)
+) -> list[DependencyOut]:
+    return [DependencyOut(**row) for row in await loop.list_dependencies(ctx.conn, project_id)]
+
+
+@router.post(
+    "/dependencies",
+    status_code=status.HTTP_201_CREATED,
+    summary="Declare that one milestone precedes another",
+)
+async def add_dependency(
+    body: DependencyIn,
+    ctx: TenantContext = Depends(tenant_context),
+    idem: Idempotency = Depends(idempotency),
+) -> JSONResponse:
+    """Refuses anything that would create a cycle.
+
+    Not a validation nicety: a cyclic map is one that can never be ordered, and
+    being orderable is the whole job of a map (invariant 1).
+    """
+
+    async def produce() -> dict:
+        try:
+            row = await loop.add_dependency(
+                ctx.conn, ctx.tenant_id, body.predecessor_id, body.successor_id
+            )
+        except loop.DomainError as exc:
+            raise as_http(exc) from exc
+        return DependencyOut(**row).model_dump(mode="json")
+
+    return await idem.run(status.HTTP_201_CREATED, produce)
+
+
+@router.delete(
+    "/dependencies",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a dependency",
+)
+async def remove_dependency(
+    predecessor_id: UUID, successor_id: UUID, ctx: TenantContext = Depends(tenant_context)
+) -> None:
+    try:
+        await loop.remove_dependency(ctx.conn, predecessor_id, successor_id)
+    except loop.DomainError as exc:
+        raise as_http(exc) from exc

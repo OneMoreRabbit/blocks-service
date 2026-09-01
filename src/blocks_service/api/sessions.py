@@ -59,8 +59,25 @@ class ParkIn(BaseModel):
 class CloseIn(BaseModel):
     outcome_tier: str | None = Field(
         default=None, pattern="^(core|full|polish)$",
-        description="Calibration evidence, never a score (invariant 8).",
+        description="Which tier was actually reached. Evidence, never a score (invariant 8).",
     )
+    interruption: str | None = Field(
+        default=None, pattern="^(boundary|hijacked|abandoned|unknown)$",
+        description=(
+            "Why the block ended. `hijacked` is a normal input, not a failure "
+            "(invariant 2) — the vocabulary is deliberately neutral."
+        ),
+    )
+
+
+class CalibrationOut(BaseModel):
+    id: UUID
+    planned_tier: str | None
+    actual_tier: str | None
+    elapsed_seconds: int | None
+    interruption: str | None
+    restart_latency_seconds: int | None
+    created_at: datetime
 
 
 class ParkingOut(BaseModel):
@@ -200,7 +217,8 @@ async def close(
 ) -> dict:
     try:
         row = await loop.close_session(
-            ctx.conn, ctx.tenant_id, session_id, expected_version, body.outcome_tier
+            ctx.conn, ctx.tenant_id, session_id, expected_version,
+            body.outcome_tier, body.interruption,
         )
     except loop.DomainError as exc:
         raise as_http(exc) from exc
@@ -217,3 +235,23 @@ async def history(
 ) -> list[ParkingOut]:
     """Append-only, so this is the whole truth: corrections appear as new records."""
     return [ParkingOut(**row) for row in await loop.parking_history(ctx.conn, session_id)]
+
+
+@router.get(
+    "/{session_id}/calibration",
+    response_model=list[CalibrationOut],
+    summary="What this session measured",
+)
+async def calibration(
+    session_id: UUID, ctx: TenantContext = Depends(tenant_context)
+) -> list[CalibrationOut]:
+    """Raw observations for one session.
+
+    Invariant 8: this returns measurements and no aggregate. There is no
+    completion rate, streak, or total here — not because they are withheld, but
+    because none is stored. A client that wants to tune something computes from
+    these; a client that wants to score someone has nothing to work with.
+    """
+    return [
+        CalibrationOut(**row) for row in await loop.calibration_for_session(ctx.conn, session_id)
+    ]
