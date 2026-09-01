@@ -44,27 +44,17 @@ requires_pg_client = pytest.mark.skipif(
     reason="pg_dump/pg_restore not installed; see the seat-tooling need in the Atlas vault",
 )
 
-def _dump_role_can_bypass_rls() -> bool:
-    from tests.conftest import ADMIN_DSN
-
-    try:
-        with psycopg.connect(ADMIN_DSN, connect_timeout=5, autocommit=True) as conn:
-            row = conn.execute(
-                "select rolsuper or rolbypassrls as ok from pg_roles where rolname = current_user"
-            ).fetchone()
-        return bool(row and row[0])
-    except Exception:
-        return False
+def _dump_role_available() -> bool:
+    """The drill needs the read-only, RLS-exempt blocks_backup role."""
+    return (pathlib.Path.home() / ".secrets" / "blocks_backup_password").exists()
 
 
 #: pg_dump cannot dump FORCE RLS tables as a role subject to those policies, so
-#: the drill needs a role exempt from them. Since the estate rotated its
-#: superuser away there is no such role reachable from this seat -- see the
-#: backup-role need in the Atlas vault. Skipped rather than silently weakened:
-#: the alternative, --enable-row-security, exits 0 and dumps no tenant rows.
+#: the drill needs blocks_backup: BYPASSRLS, pg_read_all_data, no write grants.
+#: Its password is delivered seat-locally, never through the Atlas vault.
 requires_dump_capable_role = pytest.mark.skipif(
-    not _dump_role_can_bypass_rls(),
-    reason="dumping role cannot bypass RLS; pg_dump cannot dump this schema — see the backup-role need",
+    not _dump_role_available(),
+    reason="no ~/.secrets/blocks_backup_password; the drill needs the blocks_backup role",
 )
 
 pytestmark = [requires_pg_client, requires_dump_capable_role]
@@ -206,3 +196,24 @@ async def test_the_drill_fails_when_a_policy_was_lost(client, auth, settings):
     with pytest.raises(drill.DrillFailure) as exc:
         drill.compare(before, drill.snapshot(scratch_admin))
     assert "policies differ" in str(exc.value)
+
+
+async def test_the_drill_fails_when_the_dispatcher_privilege_is_widened(client, auth, settings):
+    """ADR-0005's exemption is declared so it can be checked -- prove the check bites."""
+    from tests.conftest import ADMIN_DSN
+
+    await _seed(client, auth)
+    assert _run_drill(settings.db_name, keep=True).returncode == 0
+
+    scratch_admin = drill.swap_db(ADMIN_DSN, SCRATCH)
+    drill.verify_dispatcher_privilege(scratch_admin)  # passes as restored
+
+    with psycopg.connect(scratch_admin, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        # Widen UPDATE from one column to the whole table -- the exact regression
+        # the architecture review caught in the first draft of ADR-0005.
+        conn.execute("grant update on blocks.outbox to blocks_dispatcher")
+
+    with pytest.raises(drill.DrillFailure) as exc:
+        drill.verify_dispatcher_privilege(scratch_admin)
+    assert "writable columns" in str(exc.value) or "table grants" in str(exc.value)

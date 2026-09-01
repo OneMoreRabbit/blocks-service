@@ -1,0 +1,207 @@
+"""The outbox dispatcher, and the privilege boundary ADR-0005 gave it."""
+
+from __future__ import annotations
+
+import asyncio
+
+import jsonschema
+import psycopg
+import pytest
+
+from blocks_service import events
+from blocks_service.db import Database
+from blocks_service.dispatcher import (
+    Dispatcher,
+    FailingSink,
+    RecordingSink,
+    SingleInstanceViolation,
+    envelope_for,
+    single_instance,
+)
+
+DISPATCHER_PASSWORD = "blocks-dev-dispatcher"
+
+
+@pytest.fixture
+async def dispatcher_db(settings):
+    db = Database(
+        settings.dsn(user="blocks_dispatcher", password=DISPATCHER_PASSWORD), min_size=1, max_size=2
+    )
+    await db.open()
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+async def _seed(client, auth, subjects=("alice", "bob")) -> list[dict]:
+    sessions = []
+    for who in subjects:
+        session = (await client.post("/v1/session", headers=auth(who))).json()
+        await client.post(
+            f"/v1/tenants/{session['personal_tenant_id']}/projects",
+            headers=auth(who),
+            json={"name": f"{who} project"},
+        )
+        sessions.append(session)
+    return sessions
+
+
+async def test_it_dispatches_every_tenants_events(client, auth, dispatcher_db):
+    sessions = await _seed(client, auth)
+    sink = RecordingSink()
+
+    dispatched = await Dispatcher(dispatcher_db, sink).dispatch_batch()
+
+    assert dispatched == 2
+    tenants = {e["tenantId"] for e in sink.delivered}
+    assert tenants == {s["personal_tenant_id"] for s in sessions}
+
+
+async def test_delivered_envelopes_match_the_published_schema(client, auth, dispatcher_db):
+    await _seed(client, auth)
+    sink = RecordingSink()
+    await Dispatcher(dispatcher_db, sink).dispatch_batch()
+
+    envelope_schema = events.CONTRACTS / "blocks-event-envelope-v0_1.schema.json"
+    import json
+
+    schema = json.loads(envelope_schema.read_text())
+    assert sink.delivered
+    for envelope in sink.delivered:
+        jsonschema.validate(envelope, schema)
+        jsonschema.validate(envelope["payload"], events.load_schema(envelope["eventType"]))
+
+
+async def test_dispatched_events_are_not_delivered_twice(client, auth, dispatcher_db):
+    await _seed(client, auth)
+    dispatcher = Dispatcher(dispatcher_db, RecordingSink())
+
+    assert await dispatcher.dispatch_batch() == 2
+    assert await dispatcher.dispatch_batch() == 0
+
+
+async def test_a_failed_delivery_marks_nothing(client, auth, dispatcher_db):
+    """At-least-once: a raise must roll the claim back, not lose the event."""
+    await _seed(client, auth)
+    failing = FailingSink()
+
+    with pytest.raises(RuntimeError):
+        await Dispatcher(dispatcher_db, failing).dispatch_batch()
+
+    # Still undispatched, so a later run delivers it.
+    recovered = RecordingSink()
+    assert await Dispatcher(dispatcher_db, recovered).dispatch_batch() == 2
+    assert len(recovered.delivered) == 2
+
+
+async def test_events_are_dispatched_in_outbox_order(client, auth, dispatcher_db):
+    await _seed(client, auth, subjects=("alice", "bob", "carol"))
+    sink = RecordingSink()
+    await Dispatcher(dispatcher_db, sink).dispatch_batch()
+
+    ids = [int(e["eventId"]) for e in sink.delivered]
+    assert ids == sorted(ids)
+
+
+async def test_the_batch_size_is_respected(client, auth, dispatcher_db):
+    await _seed(client, auth, subjects=("alice", "bob", "carol"))
+    sink = RecordingSink()
+    dispatcher = Dispatcher(dispatcher_db, sink, batch_size=2)
+
+    assert await dispatcher.dispatch_batch() == 2
+    assert await dispatcher.dispatch_batch() == 1
+
+
+async def test_a_second_dispatcher_is_refused(dispatcher_db, settings):
+    async with single_instance(dispatcher_db):
+        other = Database(
+            settings.dsn(user="blocks_dispatcher", password=DISPATCHER_PASSWORD),
+            min_size=1,
+            max_size=2,
+        )
+        await other.open()
+        try:
+            with pytest.raises(SingleInstanceViolation):
+                async with single_instance(other):
+                    pass
+        finally:
+            await other.close()
+
+
+async def test_run_forever_stops_promptly(client, auth, dispatcher_db):
+    await _seed(client, auth)
+    sink = RecordingSink()
+    dispatcher = Dispatcher(dispatcher_db, sink, poll_seconds=0.05)
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(dispatcher.run_forever(stop))
+    await asyncio.sleep(0.2)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert len(sink.delivered) == 2
+
+
+# --------------------------------------------------------------------------
+# The privilege boundary ADR-0005 decided, asserted against the real role
+# --------------------------------------------------------------------------
+
+
+async def test_the_dispatcher_role_cannot_bypass_rls(dispatcher_db):
+    await dispatcher_db.assert_cannot_bypass_rls()
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        ("tenant_id", "(select id from blocks.tenants limit 1)"),
+        ("event_type", "'forged'"),
+        ("event_version", "'9.9'"),
+        ("payload", "'{\"forged\": true}'::jsonb"),
+        ("occurred_at", "now()"),
+    ],
+)
+async def test_the_dispatcher_cannot_rewrite_the_envelope_or_its_owner(
+    client, auth, dispatcher_db, column, value
+):
+    """The column grant, not the policy, is what stops this.
+
+    The policy says `using (true)` -- every row is visible and updatable as far
+    as RLS is concerned. Only the column-level grant keeps the dispatcher from
+    moving an event into another tenant or forging its contents.
+    """
+    await _seed(client, auth)
+    async with dispatcher_db.transaction() as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await conn.execute(f"update blocks.outbox set {column} = {value}")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "insert into blocks.outbox (tenant_id, event_type, event_version, payload)"
+        " select tenant_id, 'x', '0.1', '{}' from blocks.outbox limit 1",
+        "delete from blocks.outbox",
+        "select count(*) from blocks.memberships",
+        "select count(*) from blocks.projects",
+        "select count(*) from blocks.users",
+        "select count(*) from blocks.tenants",
+    ],
+)
+async def test_the_dispatcher_reaches_nothing_beyond_the_outbox(client, auth, dispatcher_db, sql):
+    await _seed(client, auth)
+    async with dispatcher_db.transaction() as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            await conn.execute(sql)
+
+
+async def test_the_dispatcher_may_write_only_the_bookkeeping_column(client, auth, dispatcher_db):
+    """The positive half: the one write it is supposed to make succeeds."""
+    await _seed(client, auth)
+    async with dispatcher_db.transaction() as conn:
+        await conn.execute("update blocks.outbox set dispatched_at = now()")
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where dispatched_at is not null"
+        )
+        assert (await cur.fetchone())["n"] == 2

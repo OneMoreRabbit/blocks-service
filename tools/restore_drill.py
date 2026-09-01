@@ -12,6 +12,12 @@ policies, the FORCE flag, or the grants looks like a complete success and is a
 total tenant-isolation failure. Every check below exists because it is a way for
 a restore to pass and still be wrong.
 
+Two roles, deliberately. `blocks_backup` reads and dumps (BYPASSRLS,
+`pg_read_all_data`, no write grants); `blocks_test_admin` creates and drops the
+scratch database (CREATEDB, no bypass). Neither can do the other's job, which is
+the point: nothing in this drill runs as a role that could both see everything
+and change it.
+
   python tools/restore_drill.py --source-db blocks --scratch-db blocks_drill
 """
 
@@ -94,8 +100,19 @@ def assert_can_dump(dsn: str) -> None:
         )
 
 
+def seat_secret(name: str) -> str | None:
+    path = pathlib.Path.home() / ".secrets" / name
+    return path.read_text().strip() if path.exists() else None
+
+
 def snapshot(dsn: str) -> dict:
-    """The facts a restore must preserve, security first."""
+    """The facts a restore must preserve, security first.
+
+    Read as `blocks_backup`, which bypasses RLS, so tenant-scoped tables can be
+    counted **grouped by tenant** rather than in total. That is the stronger
+    check: a restore that returned the right number of rows attributed to the
+    wrong tenants would pass a total and fail this.
+    """
     with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
         migrations = conn.execute(
             "select version, checksum from blocks.schema_migrations order by version"
@@ -121,18 +138,13 @@ def snapshot(dsn: str) -> dict:
         counts = {}
         for table in ("users", "tenants"):  # identity plane, no RLS
             counts[table] = conn.execute(f"select count(*) as n from blocks.{table}").fetchone()["n"]
-        tenant_ids = [
-            r["id"] for r in conn.execute("select id from blocks.tenants order by id").fetchall()
-        ]
-        for tenant_id in tenant_ids:
-            with conn.transaction():
-                conn.execute(
-                    "select set_config('blocks.tenant_id', %s, true)", (str(tenant_id),)
-                )
-                for table in TENANT_TABLES:
-                    counts[f"{table}@{tenant_id}"] = conn.execute(
-                        f"select count(*) as n from blocks.{table}"
-                    ).fetchone()["n"]
+        for table in TENANT_TABLES:
+            rows = conn.execute(
+                f"select tenant_id, count(*) as n from blocks.{table}"
+                " group by tenant_id order by tenant_id"
+            ).fetchall()
+            for row in rows:
+                counts[f"{table}@{row['tenant_id']}"] = row["n"]
     return {
         "migrations": [tuple(r.values()) for r in migrations],
         "rls": {r["relname"]: (r["relrowsecurity"], r["relforcerowsecurity"]) for r in rls},
@@ -140,6 +152,78 @@ def snapshot(dsn: str) -> dict:
         "grants": sorted((r["table_name"], r["privilege_type"]) for r in grants),
         "counts": counts,
     }
+
+
+#: The privilege shape ADR-0005 decided. Asserted as an exact set, not a subset:
+#: the failure worth catching is a LATER widening -- a policy or grant added by
+#: anyone, for any reason -- which a "contains" check would wave through.
+EXPECTED_OUTBOX_POLICIES = {
+    "outbox_tenant_isolation",
+    "outbox_dispatcher_read",
+    "outbox_dispatcher_mark",
+}
+EXPECTED_DISPATCHER_TABLE_GRANTS = {("outbox", "SELECT")}
+#: WRITE privileges only. information_schema.column_privileges expands a
+#: table-level SELECT into one row per column, so an unfiltered set would be
+#: dominated by reads that the table-grant check already covers. What must be
+#: exact is what the dispatcher can WRITE.
+EXPECTED_DISPATCHER_COLUMN_WRITES = {("outbox", "dispatched_at", "UPDATE")}
+WRITE_PRIVILEGES = ("INSERT", "UPDATE", "REFERENCES")
+
+
+def verify_dispatcher_privilege(dsn: str) -> None:
+    """The dispatcher's exemption is declared, so it can be checked. Check it.
+
+    A role attribute could not have been verified this way -- that is the
+    argument ADR-0005 made, and this is the part of it that has to be kept true.
+    """
+    with psycopg.connect(dsn, row_factory=dict_row, autocommit=True) as conn:
+        policies = {
+            r["policyname"]
+            for r in conn.execute(
+                "select policyname from pg_policies"
+                " where schemaname = 'blocks' and tablename = 'outbox'"
+            ).fetchall()
+        }
+        table_grants = {
+            (r["table_name"], r["privilege_type"])
+            for r in conn.execute(
+                "select table_name, privilege_type from information_schema.table_privileges"
+                " where table_schema = 'blocks' and grantee = 'blocks_dispatcher'"
+            ).fetchall()
+        }
+        column_writes = {
+            (r["table_name"], r["column_name"], r["privilege_type"])
+            for r in conn.execute(
+                "select table_name, column_name, privilege_type"
+                " from information_schema.column_privileges"
+                " where table_schema = 'blocks' and grantee = 'blocks_dispatcher'"
+                "   and privilege_type = any(%s)",
+                (list(WRITE_PRIVILEGES),),
+            ).fetchall()
+        }
+        role = conn.execute(
+            "select rolsuper, rolbypassrls from pg_roles where rolname = 'blocks_dispatcher'"
+        ).fetchone()
+
+    if policies != EXPECTED_OUTBOX_POLICIES:
+        raise DrillFailure(
+            f"blocks.outbox policies are {sorted(policies)}, expected "
+            f"{sorted(EXPECTED_OUTBOX_POLICIES)} (ADR-0005)"
+        )
+    if table_grants != EXPECTED_DISPATCHER_TABLE_GRANTS:
+        raise DrillFailure(
+            f"blocks_dispatcher table grants are {sorted(table_grants)}, expected "
+            f"{sorted(EXPECTED_DISPATCHER_TABLE_GRANTS)} (ADR-0005)"
+        )
+    if column_writes != EXPECTED_DISPATCHER_COLUMN_WRITES:
+        raise DrillFailure(
+            f"blocks_dispatcher writable columns are {sorted(column_writes)}, expected "
+            f"{sorted(EXPECTED_DISPATCHER_COLUMN_WRITES)} (ADR-0005)"
+        )
+    if role and (role["rolsuper"] or role["rolbypassrls"]):
+        raise DrillFailure("blocks_dispatcher holds SUPERUSER or BYPASSRLS (ADR-0005)")
+    print("  ok     dispatcher privilege matches ADR-0005 exactly")
 
 
 def verify_isolation(app_dsn: str) -> None:
@@ -214,6 +298,11 @@ def main() -> int:
         default=os.environ.get("BLOCKS_TEST_ADMIN_DSN") or os.environ.get("BLOCKS_ADMIN_DSN"),
         help="a CREATEDB role that owns the scratch database; NOT a superuser",
     )
+    parser.add_argument(
+        "--dump-dsn",
+        default=os.environ.get("BLOCKS_BACKUP_DSN"),
+        help="the read-only, RLS-exempt role that takes the dump (default: blocks_backup)",
+    )
     parser.add_argument("--source-db", default=os.environ.get("BLOCKS_DB_NAME", "blocks"))
     parser.add_argument("--scratch-db", default="blocks_drill")
     parser.add_argument("--app-user", default=os.environ.get("BLOCKS_DB_APP_USER", "blocks_app"))
@@ -225,9 +314,22 @@ def main() -> int:
         print("BLOCKS_TEST_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
         return 2
 
-    source_dsn = swap_db(args.admin_dsn, args.source_db)
-    scratch_dsn = swap_db(args.admin_dsn, args.scratch_db)
-    cli, env = dsn_to_args(args.admin_dsn)
+    dump_dsn = args.dump_dsn
+    if not dump_dsn and (password := seat_secret("blocks_backup_password")):
+        dump_dsn = as_role(swap_db(args.admin_dsn, args.source_db), "blocks_backup", password)
+    if not dump_dsn:
+        print(
+            "no dump role: set BLOCKS_BACKUP_DSN or place the blocks_backup password at "
+            "~/.secrets/blocks_backup_password",
+            file=sys.stderr,
+        )
+        return 2
+
+    source_dsn = swap_db(dump_dsn, args.source_db)
+    scratch_dsn = swap_db(dump_dsn, args.scratch_db)
+    admin_scratch_dsn = swap_db(args.admin_dsn, args.scratch_db)
+    cli, env = dsn_to_args(source_dsn)
+    admin_cli, admin_env = dsn_to_args(args.admin_dsn)
 
     try:
         print(f"drill: {args.source_db} -> {args.scratch_db}")
@@ -251,14 +353,20 @@ def main() -> int:
                 # for real reasons rather than for a missing CONNECT.
                 conn.execute(
                     f'grant connect on database "{args.scratch_db}"'
-                    " to blocks_owner, blocks_migrator, blocks_app"
+                    " to blocks_owner, blocks_migrator, blocks_app, blocks_backup"
                 )
 
-            run(["pg_restore", *cli, "-d", args.scratch_db, "--exit-on-error", str(dump)], env=env)
+            # Restored by the admin role, not the dump role: blocks_backup has no
+            # write grants at all, which is exactly why it is safe to hold BYPASSRLS.
+            run(
+                ["pg_restore", *admin_cli, "-d", args.scratch_db, "--exit-on-error", str(dump)],
+                env=admin_env,
+            )
             print("  ok     pg_restore --exit-on-error")
 
         after = snapshot(scratch_dsn)
         compare(before, after)
+        verify_dispatcher_privilege(admin_scratch_dsn)
         # Reconnect as the RUNTIME role, not the admin one the restore ran as:
         # the question is whether the restored copy isolates the service, and an
         # admin connection could not answer it either way.

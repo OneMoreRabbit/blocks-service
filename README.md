@@ -43,6 +43,19 @@ Run it:
 `GET /health/ready` reports `tenant_isolation: enforced` only if the connected
 role can neither bypass RLS nor own the tables.
 
+Run the worker (the outbox dispatcher):
+
+```sh
+PYTHONPATH=src BLOCKS_DB_DISPATCHER_PASSWORD=blocks-dev-dispatcher \
+  .venv/bin/python -m blocks_service.dispatcher
+```
+
+Delivery is **at-least-once**: a batch is claimed, delivered and marked in one
+transaction, so a crash mid-batch redelivers rather than loses. Consumers
+deduplicate on `eventId`. The only sink today logs the envelope — no consumer
+exists yet, and a stub that pretended to deliver would be worse than one that
+says what it is.
+
 ## Backup and restore
 
 `tools/restore_drill.py` dumps the database, restores it into a scratch copy, and
@@ -81,8 +94,22 @@ Two consequences:
 - Never grant the runtime role ownership, `SUPERUSER`, or `BYPASSRLS`. Any of
   the three turns every policy in the schema into a comment.
 
+## Database roles
+
+Six, and the separation is load-bearing rather than ceremonial. `blocks_owner`
+owns the schema; `blocks_migrator` runs migrations under it; `blocks_app` is the
+API's runtime role; `blocks_dispatcher` may read every tenant's outbox rows and
+write exactly one column of them (ADR-0005); `blocks_backup` may read everything
+and write nothing; `blocks_test_admin` builds and tears down test databases.
+
+Only `blocks_backup` holds `BYPASSRLS`, because `pg_dump` cannot dump `FORCE`-RLS
+tables without it — and it is compensated by having no write grant anywhere. No
+role that serves requests or mutates data is exempt from the policies.
+`tools/bootstrap_roles.sql` is the one definition; the orchestrator applies it.
+
 ## Not yet built
 
-The container image is unbuilt (no container runtime on the seat), there is no
-outbox dispatcher or worker process, and identity runs against a substituted
-verifier rather than a real OIDC issuer. See the development plan in the vault.
+Identity runs against a substituted verifier rather than a real OIDC issuer, the
+dispatcher has no retry or poison-message handling, and the domain is still
+projects only — no blocks, bindings, map, work sessions, or parking. See the
+development plan in the vault.

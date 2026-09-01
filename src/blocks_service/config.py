@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     db_migrator_user: str = "blocks_migrator"
     db_migrator_password: str = ""
 
+    #: The worker's role. Sees every tenant's outbox rows and may write exactly
+    #: one column of them (ADR-0005). Never used by the API process.
+    db_dispatcher_user: str = "blocks_dispatcher"
+    db_dispatcher_password: str = ""
+
+    dispatch_batch_size: int = 100
+    dispatch_poll_seconds: float = 1.0
+
     db_pool_min: int = 1
     db_pool_max: int = 8
 
@@ -102,6 +110,10 @@ class Settings(BaseSettings):
     @property
     def migrator_dsn(self) -> str:
         return self.dsn(user=self.db_migrator_user, password=self.db_migrator_password)
+
+    @property
+    def dispatcher_dsn(self) -> str:
+        return self.dsn(user=self.db_dispatcher_user, password=self.db_dispatcher_password)
 
 
 @lru_cache(maxsize=1)

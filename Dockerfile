@@ -34,8 +34,17 @@ WORKDIR /app
 USER blocks
 EXPOSE 8080
 
-# Migrations are NOT run on container start. They are a separate, ordered step
-# the orchestrator invokes (`python tools/migrate.py`) with the migrator role;
-# a replica set that each migrated itself on boot would race.
+# One image, two processes, selected by command:
+#
+#   API    (default below)
+#   worker  python -m blocks_service.dispatcher
+#
+# They share a domain model, a schema and a release cadence, so they ship
+# together. They do NOT share a database role: the API runs as blocks_app and the
+# worker as blocks_dispatcher, whose privileges are disjoint by design (ADR-0005).
+#
+# Migrations are NOT run on container start. They are a separate, ordered step the
+# orchestrator invokes (`python tools/migrate.py`) with the migrator role; a
+# replica set that each migrated itself on boot would race.
 CMD ["uvicorn", "--factory", "blocks_service.app:create_app", \
      "--host", "0.0.0.0", "--port", "8080"]
