@@ -5,13 +5,14 @@ from __future__ import annotations
 import contextlib
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .api import health, projects, session
+from .api import blocks, changes, health, map as map_api, projects, session, sessions
+from .api.deps import require_supported_client
 from .config import Settings, get_settings
 from .errors import ErrorCode
 from .db import Database
@@ -79,7 +80,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(session.router)
-    app.include_router(projects.router)
+
+    # Everything below is tenant-scoped and version-gated. Health and session
+    # bootstrap are not: a client that is too old must still be able to reach a
+    # readiness probe and learn *why* it is being refused.
+    gated = [Depends(require_supported_client)]
+    app.include_router(projects.router, dependencies=gated)
+    app.include_router(blocks.router, dependencies=gated)
+    app.include_router(map_api.router, dependencies=gated)
+    app.include_router(sessions.router, dependencies=gated)
+    app.include_router(changes.router, dependencies=gated)
     _publish_error_responses(app)
     return app
 

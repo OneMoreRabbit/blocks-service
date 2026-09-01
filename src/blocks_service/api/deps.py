@@ -12,6 +12,14 @@ from fastapi import Depends, Path, Request
 from .. import errors, repository
 from ..db import Database
 from ..identity import IdentityVerifier, InvalidToken, Principal
+from ..idempotency import Idempotency, fingerprint
+from ..operating_loop import (
+    ActiveSessionExists,
+    ConcurrencyConflict,
+    DomainError,
+    IllegalTransition,
+    NotFound,
+)
 
 
 def get_db(request: Request) -> Database:
@@ -82,3 +90,78 @@ async def tenant_context(
         if role is None:
             raise errors.unauthorized()
         yield TenantContext(conn=conn, tenant_id=tenant_id, actor_id=actor_id, role=role)
+
+
+async def idempotency(
+    request: Request, ctx: "TenantContext" = Depends(tenant_context)
+) -> Idempotency:
+    """Bind an `Idempotency-Key`, if the client sent one, to this transaction."""
+    return Idempotency(
+        ctx.conn,
+        ctx.tenant_id,
+        request.headers.get("idempotency-key"),
+        fingerprint(request.method, request.url.path, await request.body()),
+    )
+
+
+def if_match_version(request: Request) -> int:
+    """The `row_version` the client believes it is acting on.
+
+    Required on every state transition, deliberately. Making it optional would
+    let a client that has never heard of concurrency overwrite a change it never
+    saw -- and offline clients are exactly the ones that will not have seen it.
+    """
+    raw = request.headers.get("if-match")
+    if raw is None:
+        raise errors.invalid_request(
+            "If-Match is required on this operation. Send the row_version you read."
+        )
+    try:
+        return int(raw.strip().strip('"').lstrip("W/").strip('"'))
+    except ValueError:
+        raise errors.invalid_request(
+            f"If-Match must be the integer row_version, not {raw!r}."
+        ) from None
+
+
+def as_http(exc: DomainError) -> errors.ApiError:
+    """Map a domain rule to the contract's error codes.
+
+    `NotFound` becomes 403, not 404: inside a tenant the caller belongs to, a
+    missing row and a row in another tenant are indistinguishable *by design* --
+    RLS returns nothing for both -- so reporting 404 would leak the difference.
+    """
+    if isinstance(exc, NotFound):
+        return errors.not_found(str(exc))
+    if isinstance(exc, (ConcurrencyConflict, IllegalTransition, ActiveSessionExists)):
+        return errors.conflict(str(exc))
+    return errors.invalid_request(str(exc))
+
+
+def _parse_version(raw: str) -> tuple[int, ...]:
+    parts = raw.strip().split("-", 1)[0].split(".")
+    return tuple(int(p) for p in parts[:3])
+
+
+def require_supported_client(request: Request) -> None:
+    """Refuse clients below the declared minimum.
+
+    A client that sends no `X-Blocks-Client-Version` is allowed through — the
+    header is additive, and refusing on its absence would break every client that
+    predates it. An unparseable value IS refused: "cannot tell" is not the same
+    as "old enough", and guessing in the client's favour is the wrong default for
+    a gate that exists to stop incompatible writes.
+    """
+    raw = request.headers.get("x-blocks-client-version")
+    if raw is None:
+        return
+    settings = request.app.state.settings
+    try:
+        if _parse_version(raw) < _parse_version(settings.min_client_version):
+            raise errors.upgrade_required(
+                f"Client {raw} is below the minimum supported {settings.min_client_version}."
+            )
+    except ValueError:
+        raise errors.invalid_request(
+            f"X-Blocks-Client-Version must be a dotted version, not {raw!r}."
+        ) from None

@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     api_title: str = "Blocks Service API"
     api_version: str = "0.1.0"
 
+    #: Clients below this are refused with 426 upgrade_required. A client that
+    #: sends no version header is allowed through: the header is additive and
+    #: existing clients predate it. Raising this is a deliberate, announced act --
+    #: an offline client may be many releases behind through no fault of its own.
+    min_client_version: str = "0.0.0"
+
     @model_validator(mode="after")
     def _refuse_unsafe_combinations(self) -> "Settings":
         if self.env is Environment.production:

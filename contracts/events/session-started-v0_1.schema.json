@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/session-started-v0_1.schema.json",
+  "title": "session.started 0.1",
+  "description": "A work session was picked up Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sessionId",
+    "projectId",
+    "coreOutcome"
+  ],
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "coreOutcome": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The outcome the block committed to. Constitution invariant 3."
+    },
+    "blockId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "boundaryAt": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "The real-world edge the march ends at, owned by the calendar."
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/session-resumed-v0_1.schema.json",
+  "title": "session.resumed 0.1",
+  "description": "A parked work session was resumed Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sessionId"
+  ],
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

@@ -20,6 +20,11 @@ CONTRACTS: Final = pathlib.Path(__file__).resolve().parents[2] / "contracts" / "
 #: eventType -> the MAJOR.MINOR its payload schema is published at.
 EVENT_VERSIONS: Final[dict[str, str]] = {
     "project.created": "0.1",
+    "block.bound": "0.1",
+    "session.started": "0.1",
+    "session.parked": "0.1",
+    "session.resumed": "0.1",
+    "session.closed": "0.1",
 }
 
 

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/session-closed-v0_1.schema.json",
+  "title": "session.closed 0.1",
+  "description": "A work session was closed Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sessionId",
+    "outcomeTier"
+  ],
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "outcomeTier": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "core",
+        "full",
+        "polish",
+        null
+      ],
+      "description": "Which tier was reached. Calibration evidence, never a score (invariant 8)."
+    }
+  }
+}

@@ -43,3 +43,20 @@ def unauthorized(message: str = "The caller is not a member of this tenant.") ->
 
 def not_found(message: str = "No such resource.") -> ApiError:
     return ApiError(status.HTTP_404_NOT_FOUND, ErrorCode.not_found, message)
+
+
+def conflict(message: str) -> ApiError:
+    """Idempotency and optimistic-concurrency failures, and illegal transitions.
+
+    All three are the same thing from the client's side: the state it believed it
+    was acting on is not the state that exists. Re-read and decide.
+    """
+    return ApiError(status.HTTP_409_CONFLICT, ErrorCode.conflict, message)
+
+
+def invalid_request(message: str) -> ApiError:
+    return ApiError(status.HTTP_400_BAD_REQUEST, ErrorCode.invalid_request, message)
+
+
+def upgrade_required(message: str) -> ApiError:
+    return ApiError(status.HTTP_426_UPGRADE_REQUIRED, ErrorCode.upgrade_required, message)

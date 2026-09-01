@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/block-bound-v0_1.schema.json",
+  "title": "block.bound 0.1",
+  "description": "A physical block was bound to a project Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "blockId",
+    "projectId",
+    "bindingId"
+  ],
+  "properties": {
+    "blockId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "bindingId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}
