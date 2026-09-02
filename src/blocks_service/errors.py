@@ -60,3 +60,29 @@ def invalid_request(message: str) -> ApiError:
 
 def upgrade_required(message: str) -> ApiError:
     return ApiError(status.HTTP_426_UPGRADE_REQUIRED, ErrorCode.upgrade_required, message)
+
+
+#: Reusable OpenAPI `responses` fragments.
+#:
+#: Declared per route rather than globally: a client generator should see the
+#: errors an operation can actually return, not a union of everything the service
+#: can raise. An endpoint documenting a 409 it cannot produce is as misleading as
+#: one omitting a 409 it can.
+def error_responses(*codes: int) -> dict:
+    described = {
+        400: "Malformed request",
+        401: "Absent, malformed, expired or untrusted token; or unknown subject",
+        403: "Not a member of this tenant — or no such tenant",
+        404: "Resource absent within a tenant the caller can see",
+        409: "Idempotency, optimistic-concurrency, or state-machine conflict",
+        426: "Client below the minimum supported version",
+    }
+    return {
+        code: {
+            "description": described[code],
+            "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+            },
+        }
+        for code in codes
+    }

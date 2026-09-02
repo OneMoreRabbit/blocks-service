@@ -134,6 +134,36 @@ async def resolve_token(conn: psycopg.AsyncConnection, token: str) -> dict:
     return row
 
 
+async def unbind_block(
+    conn: psycopg.AsyncConnection, tenant_id: UUID, block_id: UUID
+) -> None:
+    """End a block's current association without opening another.
+
+    The block stays registered and its tag keeps resolving, to a block with no
+    project. That matters physically: a block can be taken out of service without
+    being destroyed, and without silently re-pointing at something else the next
+    time someone taps it.
+    """
+    cur = await conn.execute(
+        "select 1 from blocks.physical_blocks where id = %s", (block_id,)
+    )
+    if await cur.fetchone() is None:
+        raise NotFound("no such block in this tenant")
+    cur = await conn.execute(
+        "update blocks.block_bindings set is_current = false, ended_at = now()"
+        " where block_id = %s and is_current",
+        (block_id,),
+    )
+    if cur.rowcount == 0:
+        raise NotFound("that block has no current binding")
+    await events.emit(
+        conn,
+        tenant_id=tenant_id,
+        event_type="block.unbound",
+        payload={"blockId": str(block_id)},
+    )
+
+
 async def bind_block(
     conn: psycopg.AsyncConnection, tenant_id: UUID, block_id: UUID, project_id: UUID
 ) -> dict:
@@ -435,6 +465,21 @@ async def close_session(
     reconstructed, and invariant 8 only works if the numbers are observations
     rather than reconstructions.
     """
+    if outcome_tier is None:
+        # Invariant 3: a boundary must preserve a completed core OR an explicitly
+        # parked continuation. Closing with neither is exactly the "silent
+        # half-finished state" the constitution refuses, so it is refused here
+        # rather than accepted and quietly lost.
+        cur = await conn.execute(
+            "select 1 from blocks.parking_records where work_session_id = %s limit 1",
+            (session_id,),
+        )
+        if await cur.fetchone() is None:
+            raise IllegalTransition(
+                "closing without an outcome tier requires an explicitly parked "
+                "continuation: park the session first, or state the tier reached"
+            )
+
     session = await _transition(conn, session_id, expected_version, "closed", stamp="closed_at")
 
     cur = await conn.execute(

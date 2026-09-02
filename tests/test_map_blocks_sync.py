@@ -332,3 +332,96 @@ async def test_an_unparseable_version_is_refused(client, auth):
         headers={**auth("alice"), "X-Blocks-Client-Version": "banana"},
     )
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Association lifecycle: bind, reassociate, unbind
+# --------------------------------------------------------------------------
+
+
+async def _block(client, auth, tenant, label="Block 7") -> dict:
+    return (
+        await client.post(
+            f"/v1/tenants/{tenant}/blocks", headers=auth("alice"), json={"label": label}
+        )
+    ).json()
+
+
+async def test_rebinding_moves_the_block_and_keeps_at_most_one_current(client, auth):
+    tenant = await _tenant(client, auth)
+    kitchen = await _project(client, auth, tenant, name="Kitchen")
+    loft = await _project(client, auth, tenant, name="Loft")
+    block = await _block(client, auth, tenant)
+    path = f"/v1/tenants/{tenant}/blocks/{block['id']}/binding"
+
+    assert (
+        await client.post(path, headers=auth("alice"), json={"project_id": kitchen})
+    ).status_code == 201
+    assert (
+        await client.post(path, headers=auth("alice"), json={"project_id": loft})
+    ).status_code == 201
+
+    resolved = await client.post(
+        f"/v1/tenants/{tenant}/blocks/lookup",
+        headers=auth("alice"),
+        json={"tag_token": block["tag_token"]},
+    )
+    assert resolved.json()["project_id"] == loft
+
+    listed = await client.get(f"/v1/tenants/{tenant}/blocks", headers=auth("alice"))
+    assert [b["bound_project_id"] for b in listed.json()] == [loft]
+
+
+async def test_a_project_may_hold_several_blocks(client, auth):
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    for label in ("Block 7", "Block 8"):
+        block = await _block(client, auth, tenant, label)
+        await client.post(
+            f"/v1/tenants/{tenant}/blocks/{block['id']}/binding",
+            headers=auth("alice"),
+            json={"project_id": project},
+        )
+
+    listed = await client.get(f"/v1/tenants/{tenant}/blocks", headers=auth("alice"))
+    assert [b["bound_project_id"] for b in listed.json()] == [project, project]
+
+
+async def test_unbinding_leaves_the_block_registered_and_resolvable(client, auth):
+    """A block can be taken out of service without being destroyed."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    block = await _block(client, auth, tenant)
+    path = f"/v1/tenants/{tenant}/blocks/{block['id']}/binding"
+    await client.post(path, headers=auth("alice"), json={"project_id": project})
+
+    assert (await client.delete(path, headers=auth("alice"))).status_code == 204
+
+    resolved = await client.post(
+        f"/v1/tenants/{tenant}/blocks/lookup",
+        headers=auth("alice"),
+        json={"tag_token": block["tag_token"]},
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["project_id"] is None
+
+
+async def test_unbinding_an_unbound_block_is_not_found(client, auth):
+    tenant = await _tenant(client, auth)
+    block = await _block(client, auth, tenant)
+    r = await client.delete(
+        f"/v1/tenants/{tenant}/blocks/{block['id']}/binding", headers=auth("alice")
+    )
+    assert r.status_code == 404
+
+
+async def test_picking_up_an_unbound_tag_is_refused(client, auth):
+    """The tag resolves, but there is no project to pick up — say so, don't guess."""
+    tenant = await _tenant(client, auth)
+    block = await _block(client, auth, tenant)
+    r = await client.post(
+        f"/v1/tenants/{tenant}/sessions",
+        headers=auth("alice"),
+        json={"tag_token": block["tag_token"], "core_outcome": "x"},
+    )
+    assert r.status_code == 400

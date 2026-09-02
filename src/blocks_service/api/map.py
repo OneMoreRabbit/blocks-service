@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .. import operating_loop as loop
+from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
 from .deps import TenantContext, as_http, idempotency, if_match_version, tenant_context
 
@@ -40,14 +40,25 @@ class MapItemOut(BaseModel):
     row_version: int
 
 
-@router.get("", response_model=list[MapItemOut], summary="Read the project's map")
+@router.get(
+    "",
+    response_model=list[MapItemOut],
+    responses=errors.error_responses(401, 403, 426),
+    summary="Read the project's map",
+)
 async def read_map(
     project_id: UUID, ctx: TenantContext = Depends(tenant_context)
 ) -> list[MapItemOut]:
     return [MapItemOut(**row) for row in await loop.list_map(ctx.conn, project_id)]
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, summary="Add a milestone")
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=MapItemOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Add a milestone",
+)
 async def add_item(
     project_id: UUID,
     body: MapItemIn,
@@ -66,7 +77,12 @@ async def add_item(
     return await idem.run(status.HTTP_201_CREATED, produce)
 
 
-@router.patch("/{item_id}", response_model=MapItemOut, summary="Update a milestone")
+@router.patch(
+    "/{item_id}",
+    response_model=MapItemOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Update a milestone",
+)
 async def update_item(
     item_id: UUID,
     body: MapItemPatch,
@@ -93,7 +109,10 @@ class DependencyOut(BaseModel):
 
 
 @router.get(
-    "/dependencies", response_model=list[DependencyOut], summary="Read the map's dependencies"
+    "/dependencies",
+    response_model=list[DependencyOut],
+    responses=errors.error_responses(401, 403, 426),
+    summary="Read the map's dependencies",
 )
 async def read_dependencies(
     project_id: UUID, ctx: TenantContext = Depends(tenant_context)
@@ -104,6 +123,8 @@ async def read_dependencies(
 @router.post(
     "/dependencies",
     status_code=status.HTTP_201_CREATED,
+    response_model=DependencyOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
     summary="Declare that one milestone precedes another",
 )
 async def add_dependency(
@@ -132,6 +153,7 @@ async def add_dependency(
 @router.delete(
     "/dependencies",
     status_code=status.HTTP_204_NO_CONTENT,
+    responses=errors.error_responses(400, 401, 403, 404, 426),
     summary="Remove a dependency",
 )
 async def remove_dependency(

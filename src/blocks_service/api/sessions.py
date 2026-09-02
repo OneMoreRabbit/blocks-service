@@ -18,9 +18,9 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from .. import operating_loop as loop
+from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
 from .deps import (
     TenantContext,
@@ -36,6 +36,20 @@ router = APIRouter(prefix="/v1/tenants/{tenant_id}/sessions", tags=["sessions"])
 class PickupIn(BaseModel):
     project_id: UUID | None = Field(default=None, description="Pick up by project.")
     tag_token: str | None = Field(default=None, description="Or pick up by NFC tag.")
+
+    @model_validator(mode="after")
+    def _exactly_one_selector(self) -> "PickupIn":
+        """Exactly one of `project_id` or `tag_token`. Enforced, not documented.
+
+        Neither is ambiguous. Both is worse: a tag resolves to a project, so
+        sending both invites a silent disagreement about which one wins. The rule
+        is machine-checked so a generated client cannot get it wrong by omission.
+        """
+        if (self.project_id is None) == (self.tag_token is None):
+            raise ValueError(
+                "provide exactly one of project_id or tag_token, not both and not neither"
+            )
+        return self
     core_outcome: str = Field(
         min_length=1, max_length=500,
         description="Required. Sized below the available window (invariant 3).",
@@ -57,6 +71,13 @@ class ParkIn(BaseModel):
 
 
 class CloseIn(BaseModel):
+    """Closing must preserve something (invariant 3).
+
+    Either state the tier reached, or have parked an explicit continuation first.
+    A close carrying neither is refused with `409`, because that is precisely the
+    silent half-finished state the constitution rules out.
+    """
+
     outcome_tier: str | None = Field(
         default=None, pattern="^(core|full|polish)$",
         description="Which tier was actually reached. Evidence, never a score (invariant 8).",
@@ -92,13 +113,32 @@ class ParkingOut(BaseModel):
 class SessionOut(BaseModel):
     id: UUID
     project_id: UUID
-    physical_block_id: UUID | None = None
-    state: str
-    core_outcome: str | None = None
+    physical_block_id: UUID | None = Field(
+        default=None, description="Null when the session was picked up by project."
+    )
+    state: str = Field(description="`active`, `parked`, `closed`, or `cancelled`.")
+    # Non-nullable: a session cannot exist without one (invariant 3). The previous
+    # optional typing let a generated client treat it as absent, which it never is.
+    core_outcome: str
     full_outcome: str | None = None
     polish_outcome: str | None = None
-    boundary_at: datetime | None = None
+    boundary_at: datetime | None = Field(
+        default=None, description="Null when no real-world boundary was declared."
+    )
+    row_version: int = Field(description="Send this back as `If-Match` on the next transition.")
+
+
+class TransitionOut(BaseModel):
+    """What every state transition returns: enough to make the next call."""
+
+    id: UUID
+    state: str
     row_version: int
+
+
+class ParkOut(BaseModel):
+    session: TransitionOut
+    parking: "ParkingOut"
 
 
 class ReentryOut(BaseModel):
@@ -108,7 +148,17 @@ class ReentryOut(BaseModel):
     )
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, summary="Pick up: start a work session")
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=SessionOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Pick up: start a work session",
+    description=(
+        "Provide **exactly one** of `project_id` or `tag_token`. Returns `409` if "
+        "you already have an active session — park or close it first."
+    ),
+)
 async def pickup(
     body: PickupIn,
     ctx: TenantContext = Depends(tenant_context),
@@ -148,7 +198,12 @@ async def pickup(
     return await idem.run(status.HTTP_201_CREATED, produce)
 
 
-@router.get("/current", response_model=ReentryOut, summary="Re-entry: where was I?")
+@router.get(
+    "/current",
+    response_model=ReentryOut,
+    responses=errors.error_responses(401, 403, 426),
+    summary="Re-entry: where was I?",
+)
 async def current(ctx: TenantContext = Depends(tenant_context)) -> ReentryOut:
     session = await loop.current_session(ctx.conn, ctx.actor_id)
     if session is None:
@@ -160,7 +215,12 @@ async def current(ctx: TenantContext = Depends(tenant_context)) -> ReentryOut:
     )
 
 
-@router.post("/{session_id}/park", summary="Park: answer the three questions")
+@router.post(
+    "/{session_id}/park",
+    response_model=ParkOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Park: answer the three questions",
+)
 async def park(
     session_id: UUID,
     body: ParkIn,
@@ -195,7 +255,12 @@ async def park(
     return await idem.run(status.HTTP_200_OK, produce)
 
 
-@router.post("/{session_id}/resume", summary="Resume a parked session")
+@router.post(
+    "/{session_id}/resume",
+    response_model=TransitionOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Resume a parked session",
+)
 async def resume(
     session_id: UUID,
     ctx: TenantContext = Depends(tenant_context),
@@ -208,7 +273,16 @@ async def resume(
     return {"id": str(row["id"]), "state": row["state"], "row_version": row["row_version"]}
 
 
-@router.post("/{session_id}/close", summary="Close a session")
+@router.post(
+    "/{session_id}/close",
+    response_model=TransitionOut,
+    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    summary="Close a session",
+    description=(
+        "Either state the `outcome_tier` reached, or park an explicit continuation "
+        "first. A close carrying neither is refused with `409` (invariant 3)."
+    ),
+)
 async def close(
     session_id: UUID,
     body: CloseIn,
@@ -228,6 +302,7 @@ async def close(
 @router.get(
     "/{session_id}/parking",
     response_model=list[ParkingOut],
+    responses=errors.error_responses(401, 403, 426),
     summary="The full parking history of a session",
 )
 async def history(
@@ -240,6 +315,7 @@ async def history(
 @router.get(
     "/{session_id}/calibration",
     response_model=list[CalibrationOut],
+    responses=errors.error_responses(401, 403, 426),
     summary="What this session measured",
 )
 async def calibration(

@@ -77,13 +77,22 @@ async def test_planned_tier_is_the_highest_the_session_committed_to(client, auth
 
 
 async def test_a_session_closed_without_a_tier_still_records_evidence(client, auth):
-    """Forcing a value would manufacture evidence; absence is a real observation."""
+    """Forcing a value would manufacture evidence; absence is a real observation.
+
+    Parked first, because invariant 3 requires a close to preserve either a
+    completed core or an explicitly parked continuation — this is the second case.
+    """
     tenant = await _tenant(client, auth)
     project = await _project(client, auth, tenant)
     session = (await _pickup(client, auth, tenant, project)).json()
+    parked = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/park",
+        headers={**auth("alice"), "If-Match": "1"},
+        json=PARK,
+    )
     await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
-        headers={**auth("alice"), "If-Match": "1"},
+        headers={**auth("alice"), "If-Match": str(parked.json()["session"]["row_version"])},
         json={},
     )
 
@@ -97,13 +106,19 @@ async def test_a_session_closed_without_a_tier_still_records_evidence(client, au
 
 
 async def test_a_hijacked_block_is_recorded_neutrally(client, auth):
-    """Invariant 2: interruption is a normal input, not a failure."""
+    """Invariant 2, in full: "a hijacked block closes early, parks its state, and
+    rolls forward" — so the park is part of the behaviour, not a test detail."""
     tenant = await _tenant(client, auth)
     project = await _project(client, auth, tenant)
     session = (await _pickup(client, auth, tenant, project)).json()
+    parked = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/park",
+        headers={**auth("alice"), "If-Match": "1"},
+        json=PARK,
+    )
     await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
-        headers={**auth("alice"), "If-Match": "1"},
+        headers={**auth("alice"), "If-Match": str(parked.json()["session"]["row_version"])},
         json={"interruption": "hijacked"},
     )
 

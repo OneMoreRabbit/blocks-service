@@ -21,6 +21,7 @@ CONTRACTS: Final = pathlib.Path(__file__).resolve().parents[2] / "contracts" / "
 EVENT_VERSIONS: Final[dict[str, str]] = {
     "project.created": "0.1",
     "block.bound": "0.1",
+    "block.unbound": "0.1",
     "session.started": "0.1",
     "session.parked": "0.1",
     "session.resumed": "0.1",

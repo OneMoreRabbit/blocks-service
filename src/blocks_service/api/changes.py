@@ -15,6 +15,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
+from .. import errors
 from ..dispatcher import envelope_for
 from .deps import TenantContext, tenant_context
 
@@ -27,7 +28,12 @@ class ChangesOut(BaseModel):
     has_more: bool
 
 
-@router.get("", response_model=ChangesOut, summary="Events since a cursor")
+@router.get(
+    "",
+    response_model=ChangesOut,
+    responses=errors.error_responses(400, 401, 403, 426),
+    summary="Events since a cursor",
+)
 async def changes(
     ctx: TenantContext = Depends(tenant_context),
     since: int = Query(0, ge=0, description="The last eventId already processed."),

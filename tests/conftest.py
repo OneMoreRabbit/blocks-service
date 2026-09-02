@@ -65,6 +65,22 @@ DEV_SECRET = "test-signing-key-not-a-secret-32b+"
 @pytest.fixture(scope="session")
 def settings() -> Settings:
     """A disposable database, rebuilt from migrations once per session."""
+    # A previous run killed mid-test leaves blocks_app connections open, and
+    # `drop database ... with (force)` then fails with "permission denied to
+    # terminate process": blocks_test_admin is not a member of blocks_app and
+    # cannot signal its backends. A role can always terminate its own, so ask
+    # blocks_app to clear its own leftovers first. Without this a single
+    # interrupted run wedges every subsequent one behind a confusing error.
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    app_dsn = f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname=blocks"
+    with psycopg.connect(app_dsn, autocommit=True) as conn:
+        conn.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity"
+            " where datname = %s and usename = current_user and pid <> pg_backend_pid()",
+            (TEST_DB,),
+        )
+
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute(f'drop database if exists "{TEST_DB}" with (force)')
         conn.execute(f'create database "{TEST_DB}"')

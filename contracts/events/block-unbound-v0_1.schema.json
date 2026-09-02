@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/block-unbound-v0_1.schema.json",
+  "title": "block.unbound 0.1",
+  "description": "A physical block's current project association was ended, with none opened in its place. Notification only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "blockId"
+  ],
+  "properties": {
+    "blockId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

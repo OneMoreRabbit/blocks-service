@@ -155,7 +155,7 @@ async def test_a_closed_session_cannot_be_resumed(client, auth):
     closed = await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
         headers={**auth("alice"), "If-Match": "1"},
-        json={},
+        json={"outcome_tier": "core"},
     )
     assert closed.status_code == 200
 
@@ -286,3 +286,87 @@ async def test_another_tenant_cannot_reach_these_sessions(client, auth):
     ]:
         r = await getattr(client, method)(path, headers=auth("bob"))
         assert r.status_code == 403, path
+
+
+# --------------------------------------------------------------------------
+# Invariant 3 at the boundary, and the pickup selector — machine-enforced
+# --------------------------------------------------------------------------
+
+
+async def test_closing_with_neither_an_outcome_nor_a_parked_continuation_is_refused(
+    client, auth
+):
+    """Invariant 3: a boundary preserves a completed core OR a parked continuation.
+
+    A close carrying neither is the silent half-finished state the constitution
+    rules out, so it is refused rather than accepted and quietly lost.
+    """
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    session = (await _pickup(client, auth, tenant, project)).json()
+
+    r = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": "1"},
+        json={},
+    )
+    assert r.status_code == 409
+    assert "parked continuation" in r.json()["error"]["message"]
+
+    # ...and the session is untouched, so the client can still park or state a tier.
+    current = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert current.json()["session"]["state"] == "active"
+
+
+async def test_closing_without_a_tier_is_allowed_after_parking(client, auth):
+    """The other half of the rule: an explicitly parked continuation qualifies."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    session = (await _pickup(client, auth, tenant, project)).json()
+
+    parked = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/park",
+        headers={**auth("alice"), "If-Match": "1"},
+        json=PARK,
+    )
+    version = parked.json()["session"]["row_version"]
+
+    closed = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": str(version)},
+        json={},
+    )
+    assert closed.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "body, why",
+    [
+        ({"core_outcome": "x"}, "neither selector"),
+        ({"core_outcome": "x", "project_id": None, "tag_token": None}, "both null"),
+    ],
+)
+async def test_pickup_requires_exactly_one_selector(client, auth, body, why):
+    tenant = await _tenant(client, auth)
+    r = await client.post(f"/v1/tenants/{tenant}/sessions", headers=auth("alice"), json=body)
+    assert r.status_code == 400, why
+    assert r.json()["error"]["code"] == "invalid_request"
+
+
+async def test_pickup_rejects_both_selectors_together(client, auth):
+    """A tag resolves to a project, so sending both invites a silent disagreement."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    registered = await client.post(
+        f"/v1/tenants/{tenant}/blocks", headers=auth("alice"), json={"label": "Block 7"}
+    )
+    r = await client.post(
+        f"/v1/tenants/{tenant}/sessions",
+        headers=auth("alice"),
+        json={
+            "project_id": project,
+            "tag_token": registered.json()["tag_token"],
+            "core_outcome": "x",
+        },
+    )
+    assert r.status_code == 400

@@ -7,7 +7,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from .. import repository
+from .. import errors, repository
 from ..db import Database
 from ..identity import Principal
 from .deps import get_db, verified_principal
@@ -33,6 +33,7 @@ class SessionOut(BaseModel):
 @router.post(
     "/session",
     response_model=SessionOut,
+    responses=errors.error_responses(401),
     summary="Exchange a verified identity token for a session",
     description=(
         "Idempotent. First call for a subject creates the user, their personal "
