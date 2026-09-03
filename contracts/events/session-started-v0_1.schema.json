@@ -2,13 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blocks.onemorerabbit.dev/schemas/session-started-v0_1.schema.json",
   "title": "session.started 0.1",
-  "description": "A work session was picked up Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "description": "A work session was picked up. Identifiers only: payloads may be carried by transports and sinks this service does not control, so user-authored text is never placed in one. Re-read the resource.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "sessionId",
-    "projectId",
-    "coreOutcome"
+    "projectId"
   ],
   "properties": {
     "sessionId": {
@@ -18,11 +17,6 @@
     "projectId": {
       "type": "string",
       "format": "uuid"
-    },
-    "coreOutcome": {
-      "type": "string",
-      "minLength": 1,
-      "description": "The outcome the block committed to. Constitution invariant 3."
     },
     "blockId": {
       "type": "string",

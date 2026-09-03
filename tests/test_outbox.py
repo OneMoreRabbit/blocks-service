@@ -95,3 +95,80 @@ async def test_a_failed_project_creation_leaves_no_event(client, auth, db: Datab
     async with db.tenant_transaction(alice["personal_tenant_id"], alice["user_id"]) as conn:
         cur = await conn.execute("select id from blocks.outbox")
         assert await cur.fetchall() == []
+
+
+# --------------------------------------------------------------------------
+# Content must not reach the log (architecture review, 2026-09-03)
+# --------------------------------------------------------------------------
+
+
+async def test_the_logging_sink_never_emits_a_payload(client, auth, caplog):
+    """The parking answers are the most sensitive text in the product.
+
+    Payloads are identifier-only by design, but a sink that relied on that would
+    be one schema change away from leaking. This asserts the sink itself, with a
+    payload deliberately stuffed with text it must drop.
+    """
+    import logging
+
+    from blocks_service.dispatcher import LoggingSink, loggable
+
+    secret = "the-board-is-still-live"
+    envelope = {
+        "eventId": "42",
+        "eventType": "session.parked",
+        "eventVersion": "0.1",
+        "tenantId": "6f1e0a1e-0000-4000-8000-000000000000",
+        "occurredAt": "2026-09-03T00:00:00+00:00",
+        "payload": {"nextPhysicalAction": secret, "mustNotForget": secret},
+        "unexpectedFutureField": secret,
+    }
+
+    with caplog.at_level(logging.INFO, logger="blocks.dispatcher"):
+        await LoggingSink().deliver(envelope)
+
+    emitted = " ".join(
+        [r.getMessage() for r in caplog.records]
+        + [repr(getattr(r, "event", "")) for r in caplog.records]
+    )
+    assert secret not in emitted
+    assert "session.parked" in emitted  # metadata still observable
+    # An allowlist, so a field added tomorrow is dropped rather than leaked.
+    assert "unexpectedFutureField" not in repr(loggable(envelope))
+
+
+async def test_session_events_carry_no_user_text(client, auth, db: Database):
+    """End to end: pick up and park, then read what actually reached the outbox."""
+    session = (await client.post("/v1/session", headers=auth("alice"))).json()
+    tenant = session["personal_tenant_id"]
+    project = (
+        await client.post(
+            f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "Kitchen"}
+        )
+    ).json()["id"]
+    started = await client.post(
+        f"/v1/tenants/{tenant}/sessions",
+        headers=auth("alice"),
+        json={"project_id": project, "core_outcome": "SECRET-CORE-OUTCOME"},
+    )
+    await client.post(
+        f"/v1/tenants/{tenant}/sessions/{started.json()['id']}/park",
+        headers={**auth("alice"), "If-Match": "1"},
+        json={
+            "where_i_am": "SECRET-WHERE",
+            "next_physical_action": "SECRET-ACTION",
+            "must_not_forget": "SECRET-FORGET",
+        },
+    )
+
+    async with db.tenant_transaction(tenant, session["user_id"]) as conn:
+        cur = await conn.execute(
+            "select event_type, payload::text as payload from blocks.outbox"
+            " where event_type like 'session.%'"
+        )
+        rows = await cur.fetchall()
+
+    assert {r["event_type"] for r in rows} == {"session.started", "session.parked"}
+    for row in rows:
+        for secret in ("SECRET-CORE-OUTCOME", "SECRET-WHERE", "SECRET-ACTION", "SECRET-FORGET"):
+            assert secret not in row["payload"], row["event_type"]

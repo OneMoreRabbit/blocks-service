@@ -90,7 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(map_api.router, dependencies=gated)
     app.include_router(sessions.router, dependencies=gated)
     app.include_router(changes.router, dependencies=gated)
-    _publish_error_responses(app)
+    _finalise_openapi(app, settings)
     return app
 
 
@@ -145,13 +145,26 @@ ERROR_SCHEMA = {
 }
 
 
-def _publish_error_responses(app: FastAPI) -> None:
-    """Make the generated description match the error semantics actually served.
+#: Routes reachable without a bearer token. Deliberately only the probes: a
+#: client too old or unauthenticated must still be able to ask whether the
+#: service is up, and learn why it is being refused.
+UNAUTHENTICATED_PATHS = frozenset({"/health/live", "/health/ready"})
 
-    FastAPI advertises a 422 on every route that validates input, and describes
-    it with its own schema. Both are wrong for this API: validation failures are
-    returned as 400 `invalid_request` in the contract envelope. Rewriting the
-    generated document keeps the published artefact honest without hand-
+
+def _finalise_openapi(app: FastAPI, settings: Settings) -> None:
+    """Make the generated description match what is actually served.
+
+    FastAPI's default document is wrong for this API in four ways, each of which
+    would mislead a generated client rather than merely annoy a reader:
+
+    - it advertises 422 on every validating route; this service returns 400;
+    - it declares no authentication, though every route but the probes requires
+      a bearer token — a generated client would have no way to send one;
+    - a union request body becomes `anyOf`, which permits BOTH members. Pickup
+      means exactly one, so it is published as `oneOf`;
+    - the idempotent-replay response header is invisible.
+
+    Rewriting the generated document keeps the artefact honest without hand-
     maintaining a spec beside the code.
     """
 
@@ -160,7 +173,7 @@ def _publish_error_responses(app: FastAPI) -> None:
             return app.openapi_schema
         schema = get_openapi(
             title=app.title,
-            version=app.version,
+            version=settings.api_version,
             summary=app.summary,
             routes=app.routes,
         )
@@ -174,6 +187,50 @@ def _publish_error_responses(app: FastAPI) -> None:
                 responses = operation.get("responses", {})
                 if responses.pop("422", None) is not None:
                     responses["400"] = {**error_ref, "description": "Malformed request"}
+        # Authentication. Bearer everywhere except the probes; `/v1/session`
+        # included, since it is where an identity token is exchanged, not where
+        # one becomes unnecessary.
+        schema["components"].setdefault("securitySchemes", {})["bearerAuth"] = {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": (
+                "An identity token from the configured OIDC issuer. Verified for "
+                "signature, expiry, issuer and audience; never issued by this service."
+            ),
+        }
+        schema["security"] = [{"bearerAuth": []}]
+        for path, operations in schema.get("paths", {}).items():
+            for operation in operations.values():
+                if path in UNAUTHENTICATED_PATHS:
+                    operation["security"] = []
+
+        # `anyOf` would permit both pickup selectors at once, which is exactly
+        # what the contract forbids. The models already reject it; say so in the
+        # published shape too, so a generator enforces it rather than a server.
+        pickup = schema["paths"].get("/v1/tenants/{tenant_id}/sessions", {}).get("post")
+        if pickup:
+            body = pickup.get("requestBody", {}).get("content", {}).get("application/json", {})
+            if "anyOf" in (body.get("schema") or {}):
+                body["schema"]["oneOf"] = body["schema"].pop("anyOf")
+
+        # Idempotent replays are indistinguishable from first responses without
+        # this header, and a client that cannot tell cannot report accurately.
+        for path, operations in schema.get("paths", {}).items():
+            for operation in operations.values():
+                if any(
+                    p.get("name") == "Idempotency-Key" for p in operation.get("parameters", [])
+                ):
+                    for code, response in operation.get("responses", {}).items():
+                        if code.startswith("2"):
+                            response.setdefault("headers", {})["Idempotent-Replay"] = {
+                                "description": (
+                                    "`true` when this response was replayed from a "
+                                    "previously stored outcome rather than executed."
+                                ),
+                                "schema": {"type": "string", "enum": ["true"]},
+                            }
+
         app.openapi_schema = schema
         return schema
 

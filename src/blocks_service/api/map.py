@@ -43,12 +43,16 @@ class MapItemOut(BaseModel):
 @router.get(
     "",
     response_model=list[MapItemOut],
-    responses=errors.error_responses(401, 403, 426),
+    responses=errors.error_responses(401, 403, 404, 426),
     summary="Read the project's map",
 )
 async def read_map(
     project_id: UUID, ctx: TenantContext = Depends(tenant_context)
 ) -> list[MapItemOut]:
+    try:
+        await loop.assert_project_exists(ctx.conn, project_id)
+    except loop.DomainError as exc:
+        raise as_http(exc) from exc
     return [MapItemOut(**row) for row in await loop.list_map(ctx.conn, project_id)]
 
 
@@ -84,6 +88,7 @@ async def add_item(
     summary="Update a milestone",
 )
 async def update_item(
+    project_id: UUID,
     item_id: UUID,
     body: MapItemPatch,
     ctx: TenantContext = Depends(tenant_context),
@@ -111,12 +116,16 @@ class DependencyOut(BaseModel):
 @router.get(
     "/dependencies",
     response_model=list[DependencyOut],
-    responses=errors.error_responses(401, 403, 426),
+    responses=errors.error_responses(401, 403, 404, 426),
     summary="Read the map's dependencies",
 )
 async def read_dependencies(
     project_id: UUID, ctx: TenantContext = Depends(tenant_context)
 ) -> list[DependencyOut]:
+    try:
+        await loop.assert_project_exists(ctx.conn, project_id)
+    except loop.DomainError as exc:
+        raise as_http(exc) from exc
     return [DependencyOut(**row) for row in await loop.list_dependencies(ctx.conn, project_id)]
 
 
@@ -128,6 +137,7 @@ async def read_dependencies(
     summary="Declare that one milestone precedes another",
 )
 async def add_dependency(
+    project_id: UUID,
     body: DependencyIn,
     ctx: TenantContext = Depends(tenant_context),
     idem: Idempotency = Depends(idempotency),
@@ -157,7 +167,10 @@ async def add_dependency(
     summary="Remove a dependency",
 )
 async def remove_dependency(
-    predecessor_id: UUID, successor_id: UUID, ctx: TenantContext = Depends(tenant_context)
+    project_id: UUID,
+    predecessor_id: UUID,
+    successor_id: UUID,
+    ctx: TenantContext = Depends(tenant_context),
 ) -> None:
     try:
         await loop.remove_dependency(ctx.conn, predecessor_id, successor_id)

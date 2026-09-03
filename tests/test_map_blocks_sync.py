@@ -425,3 +425,43 @@ async def test_picking_up_an_unbound_tag_is_refused(client, auth):
         json={"tag_token": block["tag_token"], "core_outcome": "x"},
     )
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Absence semantics on child collections (architecture review, 2026-09-03)
+# --------------------------------------------------------------------------
+
+
+async def test_child_collections_of_a_missing_parent_are_404_not_empty(client, auth):
+    """A stale id must not look like a parent with nothing in it.
+
+    404 leaks nothing here: the caller is already a member of the tenant, and
+    between tenants the answer is 403 long before this is reached.
+    """
+    from uuid import uuid4
+
+    tenant = await _tenant(client, auth)
+    ghost = uuid4()
+
+    for path in (
+        f"/v1/tenants/{tenant}/projects/{ghost}/map",
+        f"/v1/tenants/{tenant}/projects/{ghost}/map/dependencies",
+        f"/v1/tenants/{tenant}/sessions/{ghost}/parking",
+        f"/v1/tenants/{tenant}/sessions/{ghost}/calibration",
+    ):
+        r = await client.get(path, headers=auth("alice"))
+        assert r.status_code == 404, path
+        assert r.json()["error"]["code"] == "not_found", path
+
+
+async def test_an_existing_parent_with_no_children_is_an_empty_list(client, auth):
+    """The other half: empty means empty, and only that."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+
+    for path in (
+        f"/v1/tenants/{tenant}/projects/{project}/map",
+        f"/v1/tenants/{tenant}/projects/{project}/map/dependencies",
+    ):
+        r = await client.get(path, headers=auth("alice"))
+        assert r.status_code == 200 and r.json() == [], path

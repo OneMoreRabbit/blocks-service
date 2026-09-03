@@ -18,7 +18,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
@@ -33,23 +33,9 @@ from .deps import (
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/sessions", tags=["sessions"])
 
 
-class PickupIn(BaseModel):
-    project_id: UUID | None = Field(default=None, description="Pick up by project.")
-    tag_token: str | None = Field(default=None, description="Or pick up by NFC tag.")
+class _PickupCommon(BaseModel):
+    """The commitment, shared by both ways of picking up."""
 
-    @model_validator(mode="after")
-    def _exactly_one_selector(self) -> "PickupIn":
-        """Exactly one of `project_id` or `tag_token`. Enforced, not documented.
-
-        Neither is ambiguous. Both is worse: a tag resolves to a project, so
-        sending both invites a silent disagreement about which one wins. The rule
-        is machine-checked so a generated client cannot get it wrong by omission.
-        """
-        if (self.project_id is None) == (self.tag_token is None):
-            raise ValueError(
-                "provide exactly one of project_id or tag_token, not both and not neither"
-            )
-        return self
     core_outcome: str = Field(
         min_length=1, max_length=500,
         description="Required. Sized below the available window (invariant 3).",
@@ -59,6 +45,31 @@ class PickupIn(BaseModel):
     boundary_at: datetime | None = Field(
         default=None, description="The real-world edge this march ends at."
     )
+
+
+class PickupByProject(_PickupCommon):
+    """Pick up by naming the project directly."""
+
+    model_config = ConfigDict(extra="forbid")
+    project_id: UUID
+
+
+class PickupByTag(_PickupCommon):
+    """Pick up by tapping a block, which resolves to its bound project."""
+
+    model_config = ConfigDict(extra="forbid")
+    tag_token: str
+
+
+#: Exactly one selector, enforced by the SHAPE rather than by a validator.
+#:
+#: `extra="forbid"` on both members is what makes this exact: sending both
+#: selectors fails each member (the other field is unexpected), and sending
+#: neither fails each member (the required field is missing). The published
+#: document carries this as `oneOf`, so a generator enforces it too — `anyOf`,
+#: which FastAPI emits for a union by default, would permit both at once and is
+#: rewritten in `app._finalise_openapi`.
+PickupIn = PickupByProject | PickupByTag
 
 
 class ParkIn(BaseModel):
@@ -160,25 +171,26 @@ class ReentryOut(BaseModel):
     ),
 )
 async def pickup(
-    body: PickupIn,
+    body: PickupByProject | PickupByTag,
     ctx: TenantContext = Depends(tenant_context),
     idem: Idempotency = Depends(idempotency),
 ) -> JSONResponse:
     async def produce() -> dict:
-        project_id, block_id = body.project_id, None
-        if body.tag_token:
+        block_id = None
+        if isinstance(body, PickupByTag):
             try:
                 resolved = await loop.resolve_token(ctx.conn, body.tag_token)
             except loop.DomainError as exc:
                 raise as_http(exc) from exc
             block_id = resolved["block_id"]
-            project_id = project_id or resolved["project_id"]
-        if project_id is None:
-            from .. import errors
-
-            raise errors.invalid_request(
-                "Provide project_id, or a tag_token for a block bound to a project."
-            )
+            project_id = resolved["project_id"]
+            if project_id is None:
+                raise errors.invalid_request(
+                    "That tag resolves to a block with no current project. "
+                    "Bind it first, or pick up by project_id."
+                )
+        else:
+            project_id = body.project_id
         try:
             row = await loop.start_session(
                 ctx.conn,
@@ -302,20 +314,29 @@ async def close(
 @router.get(
     "/{session_id}/parking",
     response_model=list[ParkingOut],
-    responses=errors.error_responses(401, 403, 426),
+    responses=errors.error_responses(401, 403, 404, 426),
     summary="The full parking history of a session",
 )
 async def history(
     session_id: UUID, ctx: TenantContext = Depends(tenant_context)
 ) -> list[ParkingOut]:
-    """Append-only, so this is the whole truth: corrections appear as new records."""
+    """Append-only, so this is the whole truth: corrections appear as new records.
+
+    A session with no parking records returns `[]`; a session that does not exist
+    returns `404`. The distinction is the point — otherwise a stale id looks like
+    a session nobody has parked.
+    """
+    try:
+        await loop.assert_session_exists(ctx.conn, session_id)
+    except loop.DomainError as exc:
+        raise as_http(exc) from exc
     return [ParkingOut(**row) for row in await loop.parking_history(ctx.conn, session_id)]
 
 
 @router.get(
     "/{session_id}/calibration",
     response_model=list[CalibrationOut],
-    responses=errors.error_responses(401, 403, 426),
+    responses=errors.error_responses(401, 403, 404, 426),
     summary="What this session measured",
 )
 async def calibration(
@@ -328,6 +349,10 @@ async def calibration(
     because none is stored. A client that wants to tune something computes from
     these; a client that wants to score someone has nothing to work with.
     """
+    try:
+        await loop.assert_session_exists(ctx.conn, session_id)
+    except loop.DomainError as exc:
+        raise as_http(exc) from exc
     return [
         CalibrationOut(**row) for row in await loop.calibration_for_session(ctx.conn, session_id)
     ]

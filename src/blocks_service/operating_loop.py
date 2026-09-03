@@ -203,6 +203,30 @@ async def bind_block(
 # ---------------------------------------------------------------------------
 
 
+async def assert_project_exists(conn: psycopg.AsyncConnection, project_id: UUID) -> None:
+    """A child collection of a project that does not exist is 404, not empty.
+
+    The choice matters and could have gone either way. An empty list is the
+    lazier read of RLS -- a project in another tenant returns no rows, so the
+    handler could just say "nothing here". But then a typo in a project id is
+    indistinguishable from a project with no milestones, and a client syncing
+    against a stale id would quietly show an empty map forever.
+
+    404 leaks nothing: the caller is already a member of this tenant, and within
+    a tenant they may see it does not exist. Between tenants the answer is 403
+    before this is ever reached.
+    """
+    cur = await conn.execute("select 1 from blocks.projects where id = %s", (project_id,))
+    if await cur.fetchone() is None:
+        raise NotFound("no such project in this tenant")
+
+
+async def assert_session_exists(conn: psycopg.AsyncConnection, session_id: UUID) -> None:
+    cur = await conn.execute("select 1 from blocks.work_sessions where id = %s", (session_id,))
+    if await cur.fetchone() is None:
+        raise NotFound("no such work session in this tenant")
+
+
 async def list_map(conn: psycopg.AsyncConnection, project_id: UUID) -> list[dict]:
     cur = await conn.execute(
         "select id, title, status::text as status, sort_key, row_version"
@@ -333,9 +357,11 @@ async def start_session(
         tenant_id=tenant_id,
         event_type="session.started",
         payload={
+            # Identifiers only. The core outcome is user-authored text and stays
+            # on the resource: an event payload may travel through transports and
+            # sinks this service does not control.
             "sessionId": str(row["id"]),
             "projectId": str(row["project_id"]),
-            "coreOutcome": row["core_outcome"],
             **({"blockId": str(row["physical_block_id"])} if row["physical_block_id"] else {}),
             **({"boundaryAt": row["boundary_at"].isoformat()} if row["boundary_at"] else {}),
         },
@@ -422,9 +448,11 @@ async def park_session(
         tenant_id=tenant_id,
         event_type="session.parked",
         payload={
+            # The three parking answers are the most sensitive text in the
+            # product. They are not put in an event; the record id is enough for
+            # a consumer to fetch them over an authenticated channel.
             "sessionId": str(session_id),
             "parkingRecordId": str(record["id"]),
-            "nextPhysicalAction": record["next_physical_action"],
         },
     )
     return session, record

@@ -50,20 +50,34 @@ class EventSink(Protocol):
     async def deliver(self, envelope: dict) -> None: ...
 
 
-class LoggingSink:
-    """Writes the envelope to the log and nothing else.
+#: The envelope fields a sink may log. An allowlist, not a denylist: a denylist
+#: silently starts leaking the day a new field is added, and the field most
+#: likely to be added is the one carrying content.
+LOGGABLE_ENVELOPE_FIELDS = ("eventId", "eventType", "eventVersion", "tenantId", "occurredAt")
 
-    The only sink that exists, because no consumer exists: the service-mediated
-    device event channel is not built. This is deliberately not a stub that
-    pretends to deliver -- it makes the outbox drain observable, and the moment a
-    real transport lands it replaces this one behind the same Protocol.
+
+def loggable(envelope: dict) -> dict:
+    """Envelope metadata only. Never `payload`, and never anything unrecognised."""
+    return {k: envelope[k] for k in LOGGABLE_ENVELOPE_FIELDS if k in envelope}
+
+
+class LoggingSink:
+    """Writes envelope METADATA to the log, and nothing else.
+
+    The only sink that exists, because no consumer exists: the device event
+    channel is not built. This is deliberately not a stub that pretends to
+    deliver -- it makes the outbox drain observable, and the moment a real
+    transport lands it replaces this one behind the same Protocol.
+
+    It logs through `loggable()` rather than filtering inline, because "the log
+    must not contain parking text" is a property worth having one testable place
+    for. Event payloads are identifier-only by design, but a log sink that
+    depended on that would be one schema change away from leaking; this holds
+    even if a payload someday carries something it should not.
     """
 
     async def deliver(self, envelope: dict) -> None:
-        log.info(
-            "event dispatched",
-            extra={"event": {k: v for k, v in envelope.items() if k != "payload"}},
-        )
+        log.info("event dispatched", extra={"event": loggable(envelope)})
 
 
 class NullSink:

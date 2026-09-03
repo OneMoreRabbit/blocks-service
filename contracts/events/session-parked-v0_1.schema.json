@@ -2,13 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blocks.onemorerabbit.dev/schemas/session-parked-v0_1.schema.json",
   "title": "session.parked 0.1",
-  "description": "A work session was parked, with the three-question record that makes re-entry possible Notification only: identifiers plus the minimum a client needs, never a replacement for reading the resource.",
+  "description": "A work session was parked. The three answers live on the resource, never in the event. Identifiers only: payloads may be carried by transports and sinks this service does not control, so user-authored text is never placed in one. Re-read the resource.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "sessionId",
-    "parkingRecordId",
-    "nextPhysicalAction"
+    "parkingRecordId"
   ],
   "properties": {
     "sessionId": {
@@ -18,11 +17,6 @@
     "parkingRecordId": {
       "type": "string",
       "format": "uuid"
-    },
-    "nextPhysicalAction": {
-      "type": "string",
-      "minLength": 1,
-      "description": "The second parking question. Carried in the event so a client can show re-entry without a round trip."
     }
   }
 }

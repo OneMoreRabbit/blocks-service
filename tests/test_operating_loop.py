@@ -20,7 +20,16 @@ async def _project(client, auth, tenant, who="alice", name="Kitchen rewire") -> 
 
 
 async def _pickup(client, auth, tenant, project, who="alice", **kw) -> dict:
-    body = {"project_id": project, "core_outcome": "Rough in the sockets"} | kw
+    """Send exactly one selector.
+
+    The request body is a closed `oneOf`: sending the unused selector — even as
+    an explicit null — matches neither member and is rejected. That is what
+    "exactly one" means once it is machine-enforced rather than described.
+    """
+    body = {"core_outcome": "Rough in the sockets"} | kw
+    if project is not None and "tag_token" not in body:
+        body["project_id"] = project
+    body = {k: v for k, v in body.items() if v is not None}
     r = await client.post(f"/v1/tenants/{tenant}/sessions", headers=auth(who), json=body)
     return r
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 import psycopg
-from fastapi import Depends, Path, Request
+from fastapi import Depends, Header, Path, Request
 
 from .. import errors, repository
 from ..db import Database
@@ -93,29 +93,49 @@ async def tenant_context(
 
 
 async def idempotency(
-    request: Request, ctx: "TenantContext" = Depends(tenant_context)
+    request: Request,
+    ctx: "TenantContext" = Depends(tenant_context),
+    idempotency_key: str | None = Header(
+        None,
+        alias="Idempotency-Key",
+        description=(
+            "Send one per distinct operation your offline queue may retry. The "
+            "outcome is stored and replayed verbatim, with `Idempotent-Replay: "
+            "true` on the repeat. Reusing a key with a different body is `409`."
+        ),
+    ),
 ) -> Idempotency:
-    """Bind an `Idempotency-Key`, if the client sent one, to this transaction."""
+    """Bind an `Idempotency-Key`, if the client sent one, to this transaction.
+
+    Declared as a `Header` parameter rather than read off the raw request so it
+    appears in the generated description — a header a client must send is part of
+    the machine contract, not a convention documented in prose.
+    """
     return Idempotency(
         ctx.conn,
         ctx.tenant_id,
-        request.headers.get("idempotency-key"),
+        idempotency_key,
         fingerprint(request.method, request.url.path, await request.body()),
     )
 
 
-def if_match_version(request: Request) -> int:
+def if_match_version(
+    if_match: str = Header(
+        ...,
+        alias="If-Match",
+        description=(
+            "**Required.** The `row_version` you read, as an integer. A stale "
+            "value is `409`; a missing one is `400`."
+        ),
+    ),
+) -> int:
     """The `row_version` the client believes it is acting on.
 
     Required on every state transition, deliberately. Making it optional would
     let a client that has never heard of concurrency overwrite a change it never
     saw -- and offline clients are exactly the ones that will not have seen it.
     """
-    raw = request.headers.get("if-match")
-    if raw is None:
-        raise errors.invalid_request(
-            "If-Match is required on this operation. Send the row_version you read."
-        )
+    raw = if_match
     try:
         return int(raw.strip().strip('"').lstrip("W/").strip('"'))
     except ValueError:
@@ -143,7 +163,17 @@ def _parse_version(raw: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts[:3])
 
 
-def require_supported_client(request: Request) -> None:
+def require_supported_client(
+    request: Request,
+    x_blocks_client_version: str | None = Header(
+        None,
+        alias="X-Blocks-Client-Version",
+        description=(
+            "Optional dotted version. Below the declared minimum is `426`; "
+            "absent is allowed; unparseable is `400`."
+        ),
+    ),
+) -> None:
     """Refuse clients below the declared minimum.
 
     A client that sends no `X-Blocks-Client-Version` is allowed through — the
@@ -152,7 +182,7 @@ def require_supported_client(request: Request) -> None:
     as "old enough", and guessing in the client's favour is the wrong default for
     a gate that exists to stop incompatible writes.
     """
-    raw = request.headers.get("x-blocks-client-version")
+    raw = x_blocks_client_version
     if raw is None:
         return
     settings = request.app.state.settings
