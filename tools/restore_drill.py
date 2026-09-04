@@ -314,6 +314,25 @@ def main() -> int:
         print("BLOCKS_TEST_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
         return 2
 
+    # Check the runtime credential BEFORE dumping. Without this the drill does all
+    # its work -- dump, create, restore, compare -- and only then fails at
+    # verify_isolation with "no password supplied", which reads like a restore
+    # problem and is not one. The test suite always passes --app-password, so this
+    # only ever bit an operator running the tool by hand: exactly the person the
+    # tool exists for.
+    if not args.app_password:
+        args.app_password = seat_secret("blocks_app_password") or ""
+    if not args.app_password:
+        print(
+            "no password for the runtime role. The final check reconnects as "
+            f"{args.app_user} to prove the RESTORED copy still isolates tenants, so "
+            "the drill cannot conclude without it.\n"
+            "Set BLOCKS_DB_APP_PASSWORD, pass --app-password, or place it at "
+            "~/.secrets/blocks_app_password.",
+            file=sys.stderr,
+        )
+        return 2
+
     dump_dsn = args.dump_dsn
     if not dump_dsn and (password := seat_secret("blocks_backup_password")):
         dump_dsn = as_role(swap_db(args.admin_dsn, args.source_db), "blocks_backup", password)
