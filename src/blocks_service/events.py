@@ -19,7 +19,12 @@ CONTRACTS: Final = pathlib.Path(__file__).resolve().parents[2] / "contracts" / "
 
 #: eventType -> the MAJOR.MINOR its payload schema is published at.
 EVENT_VERSIONS: Final[dict[str, str]] = {
-    "project.created": "0.1",
+    # 0.2 dropped the project `name`: identifiers only (architecture ruling,
+    # 2026-09-04). 0.1 is preserved on disk and still resolvable, because rows
+    # already in the outbox are stamped 0.1 and must stay readable against the
+    # schema they were written against -- which is the entire reason the version
+    # is stamped per row rather than per deployment.
+    "project.created": "0.2",
     "block.bound": "0.1",
     "block.unbound": "0.1",
     "session.started": "0.1",
@@ -38,9 +43,26 @@ def schema_path(event_type: str, version: str) -> pathlib.Path:
     return CONTRACTS / f"{stem}-v{version.replace('.', '_')}.schema.json"
 
 
-def load_schema(event_type: str) -> dict:
-    version = EVENT_VERSIONS[event_type]
-    return json.loads(schema_path(event_type, version).read_text())
+def load_schema(event_type: str, version: str | None = None) -> dict:
+    """The schema for an event type, at the CURRENT version unless one is named.
+
+    A consumer reading history passes the version stamped on the row. Defaulting
+    to the current version would validate an old payload against a newer shape
+    and call correct history a defect.
+    """
+    return json.loads(schema_path(event_type, version or EVENT_VERSIONS[event_type]).read_text())
+
+
+def known_versions(event_type: str) -> list[str]:
+    """Every published version of an event's payload schema, oldest first."""
+    stem = event_type.replace(".", "-")
+    found = []
+    for path in sorted(CONTRACTS.glob(f"{stem}-v*.schema.json")):
+        # `.stem` leaves ".schema" on a double extension, so take the name apart
+        # explicitly rather than trusting it.
+        version = path.name[len(stem) + 2 : -len(".schema.json")]
+        found.append(version.replace("_", "."))
+    return found
 
 
 async def emit(

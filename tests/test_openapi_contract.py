@@ -134,11 +134,12 @@ def test_the_document_version_matches_the_contract(spec):
 # Event payloads must not carry user-authored text
 # --------------------------------------------------------------------------
 
-#: `project.created` carries `name`, and it is in the ACCEPTED 0.1 contract.
-#: Removing it is a breaking change to an artefact a consumer may have generated
-#: from, so it is raised for decision rather than changed unilaterally. Listed
-#: here so the exception is explicit and cannot quietly grow.
-KNOWN_TEXT_CARRYING_EVENTS = {"project.created"}
+#: No exceptions. `project.created` was the last one: it carried `name` in an
+#: accepted-0.1 payload, and the architecture ruling of 2026-09-04 was to publish
+#: an identifier-only 0.2 rather than mutate 0.1. The skip that held its place is
+#: now an assertion, which is the point of the ruling -- an exception nobody can
+#: see stops being an exception and becomes the rule.
+KNOWN_TEXT_CARRYING_EVENTS: set[str] = set()
 
 #: Field names whose values are typed by a human.
 TEXT_FIELDS = {
@@ -149,9 +150,41 @@ TEXT_FIELDS = {
 
 @pytest.mark.parametrize("event_type", sorted(events.EVENT_VERSIONS))
 def test_event_payloads_carry_identifiers_not_content(event_type):
-    """Payloads travel through transports and sinks this service does not control."""
-    if event_type in KNOWN_TEXT_CARRYING_EVENTS:
-        pytest.skip(f"{event_type} predates this rule; raised for decision")
+    """Payloads travel through transports and sinks this service does not control.
+
+    Every currently-emitted event, with no exemptions. The list above is empty and
+    should stay that way: a named exception is a rule with a hole in it, and this
+    one took three weeks and an architecture ruling to close.
+    """
+    assert not KNOWN_TEXT_CARRYING_EVENTS, "the exemption list should stay empty"
     schema = events.load_schema(event_type)
     offending = set(schema.get("properties", {})) & TEXT_FIELDS
     assert not offending, f"{event_type} carries user text: {sorted(offending)}"
+
+
+def test_project_created_is_now_identifier_only():
+    """The ruling, asserted directly rather than only through the sweep."""
+    assert events.EVENT_VERSIONS["project.created"] == "0.2"
+    assert set(events.load_schema("project.created")["properties"]) == {"projectId"}
+
+
+def test_the_superseded_project_created_schema_is_preserved():
+    """0.1 rows are already in the outbox and must stay readable.
+
+    Deleting the old schema would make correct history unvalidatable — which is
+    the whole reason the version is stamped on the row rather than assumed from
+    the deployment.
+    """
+    assert events.known_versions("project.created") == ["0.1", "0.2"]
+    historical = events.load_schema("project.created", "0.1")
+    assert "name" in historical["properties"]
+
+
+def test_a_historical_payload_validates_against_its_own_stamped_version():
+    """Validating old history against the new shape would call it a defect."""
+    import jsonschema
+
+    old_payload = {"projectId": "6f1e0a1e-0000-4000-8000-000000000000", "name": "Kitchen"}
+    jsonschema.validate(old_payload, events.load_schema("project.created", "0.1"))
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(old_payload, events.load_schema("project.created", "0.2"))

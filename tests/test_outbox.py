@@ -32,8 +32,10 @@ async def test_creating_a_project_appends_exactly_one_event(client, auth, db: Da
 
     assert len(rows) == 1
     assert rows[0]["event_type"] == "project.created"
-    assert rows[0]["event_version"] == "0.1"
-    assert rows[0]["payload"] == {"projectId": created.json()["id"], "name": "Shed"}
+    assert rows[0]["event_version"] == "0.2"
+    # Identifier only: 0.1 carried the project name, 0.2 does not.
+    assert rows[0]["payload"] == {"projectId": created.json()["id"]}
+    assert "Shed" not in str(rows[0]["payload"])
     assert rows[0]["dispatched_at"] is None
 
 
@@ -47,12 +49,18 @@ async def test_emitted_payloads_validate_against_the_published_schema(client, au
     )
 
     async with db.tenant_transaction(alice["personal_tenant_id"], alice["user_id"]) as conn:
-        cur = await conn.execute("select event_type, payload from blocks.outbox")
+        cur = await conn.execute(
+            "select event_type, event_version, payload from blocks.outbox"
+        )
         rows = await cur.fetchall()
 
     assert rows
     for row in rows:
-        jsonschema.validate(row["payload"], events.load_schema(row["event_type"]))
+        # Validate against the version the row was STAMPED with, not the current
+        # one. That is what the stamp is for.
+        jsonschema.validate(
+            row["payload"], events.load_schema(row["event_type"], row["event_version"])
+        )
 
 
 def test_every_declared_event_type_has_a_published_schema():

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-created-v0_2.schema.json",
+  "title": "project.created 0.2",
+  "description": "A project was created. Identifiers only. 0.1 carried the project `name`; event payloads travel through transports and sinks this service does not control, so user-authored text is no longer placed in one. Read the project resource for its name.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "projectId"
+  ],
+  "properties": {
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

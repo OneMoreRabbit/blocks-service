@@ -166,6 +166,8 @@ async def create_project(
         conn,
         tenant_id=tenant_id,
         event_type="project.created",
-        payload={"projectId": str(project.id), "name": project.name},
+        # Identifiers only. The project name is user-authored text and stays on
+        # the resource; 0.1 carried it, 0.2 does not.
+        payload={"projectId": str(project.id)},
     )
     return project
