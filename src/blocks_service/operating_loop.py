@@ -402,6 +402,40 @@ async def _transition(
     return row
 
 
+async def _append_parking(
+    conn: psycopg.AsyncConnection,
+    tenant_id: UUID,
+    session_id: UUID,
+    *,
+    actor_id: UUID,
+    where_i_am: str,
+    next_physical_action: str,
+    must_not_forget: str,
+    device_id: UUID | None = None,
+) -> dict:
+    """Append one immutable parking record. Shared by park and by atomic close."""
+    cur = await conn.execute(
+        "select coalesce(max(sequence), 0) + 1 as n from blocks.parking_records"
+        " where work_session_id = %s",
+        (session_id,),
+    )
+    sequence = (await cur.fetchone())["n"]
+    cur = await conn.execute(
+        "insert into blocks.parking_records"
+        " (tenant_id, work_session_id, where_i_am, next_physical_action, must_not_forget,"
+        "  authored_by_user_id, device_id, sequence)"
+        " values (%s, %s, %s, %s, %s, %s, %s, %s)"
+        " returning id, where_i_am, next_physical_action, must_not_forget, sequence, created_at",
+        (
+            tenant_id, session_id, where_i_am, next_physical_action, must_not_forget,
+            actor_id, device_id, sequence,
+        ),
+    )
+    record = await cur.fetchone()
+    assert record is not None
+    return record
+
+
 async def park_session(
     conn: psycopg.AsyncConnection,
     tenant_id: UUID,
@@ -421,27 +455,12 @@ async def park_session(
     forbids, so it is not a state this can produce.
     """
     session = await _transition(conn, session_id, expected_version, "parked", stamp="parked_at")
-
-    cur = await conn.execute(
-        "select coalesce(max(sequence), 0) + 1 as n from blocks.parking_records"
-        " where work_session_id = %s",
-        (session_id,),
+    record = await _append_parking(
+        conn, tenant_id, session_id,
+        actor_id=actor_id, where_i_am=where_i_am,
+        next_physical_action=next_physical_action, must_not_forget=must_not_forget,
+        device_id=device_id,
     )
-    sequence = (await cur.fetchone())["n"]
-
-    cur = await conn.execute(
-        "insert into blocks.parking_records"
-        " (tenant_id, work_session_id, where_i_am, next_physical_action, must_not_forget,"
-        "  authored_by_user_id, device_id, sequence)"
-        " values (%s, %s, %s, %s, %s, %s, %s, %s)"
-        " returning id, where_i_am, next_physical_action, must_not_forget, sequence, created_at",
-        (
-            tenant_id, session_id, where_i_am, next_physical_action, must_not_forget,
-            actor_id, device_id, sequence,
-        ),
-    )
-    record = await cur.fetchone()
-    assert record is not None
 
     await events.emit(
         conn,
@@ -485,15 +504,43 @@ async def close_session(
     expected_version: int,
     outcome_tier: str | None = None,
     interruption: str | None = None,
-) -> dict:
+    *,
+    actor_id: UUID | None = None,
+    continuation: dict | None = None,
+) -> tuple[dict, dict | None]:
     """Close a session and record what it measured.
 
-    The calibration event is written in the same transaction as the close. Not
-    for durability theatre -- because evidence gathered later is evidence
-    reconstructed, and invariant 8 only works if the numbers are observations
-    rather than reconstructions.
+    Two forms, and the second exists because of a real offline failure Android
+    found. A client that queues "park" then "close" while offline cannot supply a
+    valid `If-Match` on the close: the park advances the row version, and the
+    queued close was written before that version existed. Sending the pre-park
+    version is stale, omitting it is invalid, and replaying close first fails
+    because no continuation exists yet. FIFO ordering does not help -- the
+    dependency is on a value that did not exist when the intent was recorded.
+
+    So "preserve this continuation and close" is one operation, guarded by the one
+    version the client actually knows. The parking record is appended and the
+    session closed in a single transaction: if the version is stale, the update
+    matches no row, the whole transaction rolls back, and NOTHING is written --
+    not even the parking record.
+
+    The calibration event is written in the same transaction too. Not durability
+    theatre -- evidence gathered later is evidence reconstructed, and invariant 8
+    only works if the numbers are observations.
     """
-    if outcome_tier is None:
+    record = None
+    if continuation is not None:
+        if outcome_tier is not None:
+            raise IllegalTransition(
+                "close takes either an outcome tier or a continuation, not both"
+            )
+        assert actor_id is not None, "a continuation must have an author"
+        # Appended BEFORE the versioned update on purpose: if that update finds no
+        # row because the version is stale, this insert rolls back with it.
+        record = await _append_parking(
+            conn, tenant_id, session_id, actor_id=actor_id, **continuation
+        )
+    elif outcome_tier is None:
         # Invariant 3: a boundary must preserve a completed core OR an explicitly
         # parked continuation. Closing with neither is exactly the "silent
         # half-finished state" the constitution refuses, so it is refused here
@@ -537,13 +584,22 @@ async def close_session(
          interruption or "boundary", latency),
     )
 
+    if record is not None:
+        # Both facts happened, so both are announced -- and the parked event
+        # carries the record id, never the three answers.
+        await events.emit(
+            conn,
+            tenant_id=tenant_id,
+            event_type="session.parked",
+            payload={"sessionId": str(session_id), "parkingRecordId": str(record["id"])},
+        )
     await events.emit(
         conn,
         tenant_id=tenant_id,
         event_type="session.closed",
         payload={"sessionId": str(session_id), "outcomeTier": outcome_tier},
     )
-    return session
+    return session, record
 
 
 async def calibration_for_session(conn: psycopg.AsyncConnection, session_id: UUID) -> list[dict]:

@@ -14,6 +14,7 @@ show up directly in this file:
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
@@ -81,18 +82,7 @@ class ParkIn(BaseModel):
     device_id: UUID | None = None
 
 
-class CloseIn(BaseModel):
-    """Closing must preserve something (invariant 3).
-
-    Either state the tier reached, or have parked an explicit continuation first.
-    A close carrying neither is refused with `409`, because that is precisely the
-    silent half-finished state the constitution rules out.
-    """
-
-    outcome_tier: str | None = Field(
-        default=None, pattern="^(core|full|polish)$",
-        description="Which tier was actually reached. Evidence, never a score (invariant 8).",
-    )
+class _CloseCommon(BaseModel):
     interruption: str | None = Field(
         default=None, pattern="^(boundary|hijacked|abandoned|unknown)$",
         description=(
@@ -100,6 +90,58 @@ class CloseIn(BaseModel):
             "(invariant 2) — the vocabulary is deliberately neutral."
         ),
     )
+
+
+class CloseWithOutcome(_CloseCommon):
+    """Close having reached a tier."""
+
+    model_config = ConfigDict(extra="forbid")
+    outcome_tier: str = Field(
+        pattern="^(core|full|polish)$",
+        description="Which tier was actually reached. Evidence, never a score (invariant 8).",
+    )
+
+
+class CloseWithContinuation(_CloseCommon):
+    """Close preserving an explicit continuation, atomically.
+
+    For the offline boundary: park and close as **one** operation, under the one
+    `If-Match` the client actually knows. Queuing park then close separately
+    cannot work offline — the park advances the row version, and the queued close
+    was written before that version existed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    where_i_am: str = Field(min_length=1, max_length=2000)
+    next_physical_action: str = Field(min_length=1, max_length=2000)
+    must_not_forget: str = Field(min_length=1, max_length=2000)
+    device_id: UUID | None = None
+
+
+class CloseOnExistingContinuation(_CloseCommon):
+    """Close a session that was ALREADY parked, without inventing a tier.
+
+    A two-form union of "outcome" and "new continuation" would silently drop this
+    flow, and it is a real one: park at lunch, decide later the block is over.
+    Forcing such a client to re-send the continuation would duplicate the record;
+    forcing an `outcome_tier` would make it claim a tier it did not reach, which
+    invariant 8 rules out as firmly as invariant 3 rules out preserving nothing.
+
+    Explicit, so it cannot be produced by accident — an empty body still matches
+    no member. The server verifies a continuation actually exists and refuses
+    with `409` if it does not.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    preserve: Literal["existing_continuation"] = Field(
+        description="Assert that this session already has a parking record to preserve."
+    )
+
+
+#: Closed union: exactly one form. Invariant 3 lives in the shape — a body
+#: matching no member cannot express "close preserving nothing", so that state is
+#: unrepresentable rather than merely refused.
+CloseIn = CloseWithOutcome | CloseWithContinuation | CloseOnExistingContinuation
 
 
 class CalibrationOut(BaseModel):
@@ -150,6 +192,21 @@ class TransitionOut(BaseModel):
 class ParkOut(BaseModel):
     session: TransitionOut
     parking: "ParkingOut"
+
+
+class CloseOut(BaseModel):
+    """What a close returns, in both forms."""
+
+    id: UUID
+    state: str
+    row_version: int = Field(description="The version after closing.")
+    parking_record_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Set when the close carried a continuation: the immutable record that "
+            "was appended in the same transaction."
+        ),
+    )
 
 
 class ReentryOut(BaseModel):
@@ -287,28 +344,56 @@ async def resume(
 
 @router.post(
     "/{session_id}/close",
-    response_model=TransitionOut,
+    response_model=CloseOut,
     responses=errors.error_responses(400, 401, 403, 404, 409, 426),
     summary="Close a session",
     description=(
-        "Either state the `outcome_tier` reached, or park an explicit continuation "
-        "first. A close carrying neither is refused with `409` (invariant 3)."
+        "Send **exactly one** form: an `outcome_tier`; the complete three-field "
+        "continuation; or `{'preserve': 'existing_continuation'}` for a session "
+        "already parked. The continuation form appends the immutable parking record "
+        "and closes the session in **one transaction** under the single `If-Match` "
+        "you already hold — so an offline client never has to guess a row version "
+        "that did not exist when it queued the intent. A stale version rolls the "
+        "whole thing back and writes nothing, not even the parking record."
     ),
 )
 async def close(
     session_id: UUID,
-    body: CloseIn,
+    body: CloseWithOutcome | CloseWithContinuation | CloseOnExistingContinuation,
     ctx: TenantContext = Depends(tenant_context),
     expected_version: int = Depends(if_match_version),
-) -> dict:
-    try:
-        row = await loop.close_session(
-            ctx.conn, ctx.tenant_id, session_id, expected_version,
-            body.outcome_tier, body.interruption,
-        )
-    except loop.DomainError as exc:
-        raise as_http(exc) from exc
-    return {"id": str(row["id"]), "state": row["state"], "row_version": row["row_version"]}
+    idem: Idempotency = Depends(idempotency),
+) -> JSONResponse:
+    async def produce() -> dict:
+        continuation = None
+        outcome_tier = None
+        if isinstance(body, CloseWithContinuation):
+            continuation = {
+                "where_i_am": body.where_i_am,
+                "next_physical_action": body.next_physical_action,
+                "must_not_forget": body.must_not_forget,
+                "device_id": body.device_id,
+            }
+        elif isinstance(body, CloseWithOutcome):
+            outcome_tier = body.outcome_tier
+        # CloseOnExistingContinuation leaves both None; the domain then verifies a
+        # parking record exists and refuses with 409 if it does not.
+        try:
+            row, record = await loop.close_session(
+                ctx.conn, ctx.tenant_id, session_id, expected_version,
+                outcome_tier, body.interruption,
+                actor_id=ctx.actor_id, continuation=continuation,
+            )
+        except loop.DomainError as exc:
+            raise as_http(exc) from exc
+        return CloseOut(
+            id=row["id"],
+            state=row["state"],
+            row_version=row["row_version"],
+            parking_record_id=record["id"] if record else None,
+        ).model_dump(mode="json")
+
+    return await idem.run(status.HTTP_200_OK, produce)
 
 
 @router.get(

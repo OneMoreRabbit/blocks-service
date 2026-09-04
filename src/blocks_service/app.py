@@ -208,9 +208,14 @@ def _finalise_openapi(app: FastAPI, settings: Settings) -> None:
         # `anyOf` would permit both pickup selectors at once, which is exactly
         # what the contract forbids. The models already reject it; say so in the
         # published shape too, so a generator enforces it rather than a server.
-        pickup = schema["paths"].get("/v1/tenants/{tenant_id}/sessions", {}).get("post")
-        if pickup:
-            body = pickup.get("requestBody", {}).get("content", {}).get("application/json", {})
+        for union_path in (
+            "/v1/tenants/{tenant_id}/sessions",
+            "/v1/tenants/{tenant_id}/sessions/{session_id}/close",
+        ):
+            operation = schema["paths"].get(union_path, {}).get("post")
+            if not operation:
+                continue
+            body = operation.get("requestBody", {}).get("content", {}).get("application/json", {})
             if "anyOf" in (body.get("schema") or {}):
                 body["schema"]["oneOf"] = body["schema"].pop("anyOf")
 

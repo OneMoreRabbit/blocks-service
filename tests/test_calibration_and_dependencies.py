@@ -93,7 +93,7 @@ async def test_a_session_closed_without_a_tier_still_records_evidence(client, au
     await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
         headers={**auth("alice"), "If-Match": str(parked.json()["session"]["row_version"])},
-        json={},
+        json={"preserve": "existing_continuation"},
     )
 
     [event] = (
@@ -119,7 +119,7 @@ async def test_a_hijacked_block_is_recorded_neutrally(client, auth):
     await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
         headers={**auth("alice"), "If-Match": str(parked.json()["session"]["row_version"])},
-        json={"interruption": "hijacked"},
+        json={"preserve": "existing_continuation", "interruption": "hijacked"},
     )
 
     [event] = (

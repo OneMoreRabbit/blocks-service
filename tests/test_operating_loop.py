@@ -317,7 +317,7 @@ async def test_closing_with_neither_an_outcome_nor_a_parked_continuation_is_refu
     r = await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
         headers={**auth("alice"), "If-Match": "1"},
-        json={},
+        json={"preserve": "existing_continuation"},
     )
     assert r.status_code == 409
     assert "parked continuation" in r.json()["error"]["message"]
@@ -343,7 +343,7 @@ async def test_closing_without_a_tier_is_allowed_after_parking(client, auth):
     closed = await client.post(
         f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
         headers={**auth("alice"), "If-Match": str(version)},
-        json={},
+        json={"preserve": "existing_continuation"},
     )
     assert closed.status_code == 200
 
