@@ -730,19 +730,64 @@ async def parking_history(conn: psycopg.AsyncConnection, session_id: UUID) -> li
     return list(await cur.fetchall())
 
 
-async def current_session(conn: psycopg.AsyncConnection, actor_id: UUID) -> dict | None:
-    """The re-entry view: the active session, or the most recently parked one.
+#: The columns the re-entry surface exposes, in one place so both branches of the
+#: lookup below cannot drift apart.
+_SESSION_COLUMNS = (
+    "id, project_id, physical_block_id, state::text as state, core_outcome,"
+    " full_outcome, polish_outcome, boundary_at, row_version, started_at"
+)
 
-    Invariant 2 -- restarting after time away must require no audit. So a parked
-    session is returned as readily as an active one; the client does not have to
-    know which state it left things in to get back to work.
+
+async def current_session(conn: psycopg.AsyncConnection, actor_id: UUID) -> dict | None:
+    """The re-entry view, in precedence order.
+
+    Constitution invariant 2 -- restarting after time away must require no audit
+    -- and invariant 4 -- *re-entry must make the newest parking record
+    immediately available*. The second is why this does not stop at `active` and
+    `parked`.
+
+    An atomic park-and-close leaves the session `closed` with a continuation
+    attached. Excluding closed sessions here would mean the one thing invariant 4
+    guarantees -- the newest parking record, immediately -- would be the one thing
+    a client could not see after the most common offline boundary. So:
+
+    1. the active session, if there is one;
+    2. otherwise the most recently parked session;
+    3. otherwise the session owning the newest non-superseded parking record,
+       whatever state it is in.
+
+    Step 3 is bounded by the record existing: a session closed with an outcome
+    tier and no continuation has nothing to return, and correctly returns nothing.
     """
     cur = await conn.execute(
-        "select id, project_id, physical_block_id, state::text as state, core_outcome,"
-        "       full_outcome, polish_outcome, boundary_at, row_version, started_at"
+        f"select {_SESSION_COLUMNS}"
         " from blocks.work_sessions"
         " where started_by_user_id = %s and state in ('active', 'parked')"
         " order by (state = 'active') desc, coalesce(parked_at, started_at) desc"
+        " limit 1",
+        (actor_id,),
+    )
+    live = await cur.fetchone()
+    if live is not None:
+        return live
+
+    # Nothing live. Fall back to whichever session owns the newest parking record
+    # that has not been superseded -- which is what invariant 4 actually names.
+    cur = await conn.execute(
+        f"select {_SESSION_COLUMNS}"
+        " from blocks.work_sessions w"
+        " where w.started_by_user_id = %s"
+        "   and exists ("
+        "     select 1 from blocks.parking_records p"
+        "     where p.work_session_id = w.id"
+        "       and not exists ("
+        "         select 1 from blocks.parking_records s where s.supersedes_id = p.id"
+        "       )"
+        "   )"
+        " order by ("
+        "   select max(p.created_at) from blocks.parking_records p"
+        "   where p.work_session_id = w.id"
+        " ) desc"
         " limit 1",
         (actor_id,),
     )

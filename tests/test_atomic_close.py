@@ -231,3 +231,137 @@ async def test_calibration_is_still_recorded_for_an_atomic_close(client, auth):
     ).json()
     assert event["interruption"] == "hijacked"
     assert event["actual_tier"] is None
+
+
+# --------------------------------------------------------------------------
+# Re-entry across a closed session (architecture ruling, 2026-09-05)
+# --------------------------------------------------------------------------
+#
+# Invariant 4: "re-entry must make the newest parking record immediately
+# available". An atomic park-and-close leaves the session closed, so excluding
+# closed sessions from /sessions/current would hide the one thing the invariant
+# guarantees, after the most common offline boundary.
+
+
+async def test_re_entry_surfaces_a_continuation_left_on_a_closed_session(client, auth):
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    session = await _session(client, auth, tenant, project)
+
+    closed = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": str(session["row_version"])},
+        json=CONTINUATION,
+    )
+    assert closed.json()["state"] == "closed"
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session"]["id"] == session["id"]
+    assert body["session"]["state"] == "closed", "the client needs to know it cannot resume"
+    assert body["parking"]["next_physical_action"] == CONTINUATION["next_physical_action"]
+    assert body["parking"]["id"] == closed.json()["parking_record_id"]
+
+
+async def test_a_live_session_still_takes_precedence_over_a_closed_one(client, auth):
+    """The fallback is a fallback: it must not shadow something resumable."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+
+    first = await _session(client, auth, tenant, project)
+    await client.post(
+        f"/v1/tenants/{tenant}/sessions/{first['id']}/close",
+        headers={**auth("alice"), "If-Match": str(first["row_version"])},
+        json=CONTINUATION,
+    )
+    second = await _session(client, auth, tenant, project)
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["session"]["id"] == second["id"]
+    assert r.json()["session"]["state"] == "active"
+
+
+async def test_the_newest_continuation_wins_across_closed_sessions(client, auth):
+    """Newer-record precedence, when both sources are closed."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+
+    for marker in ("older continuation", "newer continuation"):
+        session = await _session(client, auth, tenant, project)
+        await client.post(
+            f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+            headers={**auth("alice"), "If-Match": str(session["row_version"])},
+            json={**CONTINUATION, "next_physical_action": marker},
+        )
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["parking"]["next_physical_action"] == "newer continuation"
+
+
+async def test_a_superseded_record_is_not_offered_at_re_entry(client, auth, db: Database):
+    """"Newest non-superseded" — a correction replaces what re-entry shows."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    session = await _session(client, auth, tenant, project)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+
+    closed = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": str(session["row_version"])},
+        json=CONTINUATION,
+    )
+    original = closed.json()["parking_record_id"]
+
+    # Append a correction. Records are immutable, so a correction is a new row
+    # linked by supersedes_id — the API for that is not built yet, so this
+    # exercises the query the way the data model intends.
+    async with db.tenant_transaction(tenant, actor) as conn:
+        await conn.execute(
+            "insert into blocks.parking_records (tenant_id, work_session_id, where_i_am,"
+            " next_physical_action, must_not_forget, authored_by_user_id, sequence,"
+            " supersedes_id) values (%s, %s, 'corrected', 'the corrected action',"
+            " 'corrected note', %s, 2, %s)",
+            (tenant, session["id"], actor, original),
+        )
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["parking"]["next_physical_action"] == "the corrected action"
+
+
+async def test_a_clean_close_leaves_nothing_to_re_enter(client, auth):
+    """A session closed on a completed core has no continuation, and says so."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    session = await _session(client, auth, tenant, project)
+
+    await client.post(
+        f"/v1/tenants/{tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": str(session["row_version"])},
+        json={"outcome_tier": "core"},
+    )
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["session"] is None
+
+
+async def test_re_entry_never_crosses_a_tenant(client, auth):
+    """The fallback query must inherit the same isolation as everything else."""
+    alice_tenant = await _tenant(client, auth, "alice")
+    project = await _project(client, auth, alice_tenant)
+    session = (await _pickup(client, auth, alice_tenant, project)).json()
+    await client.post(
+        f"/v1/tenants/{alice_tenant}/sessions/{session['id']}/close",
+        headers={**auth("alice"), "If-Match": str(session["row_version"])},
+        json=CONTINUATION,
+    )
+
+    bob_tenant = await _tenant(client, auth, "bob")
+    r = await client.get(f"/v1/tenants/{bob_tenant}/sessions/current", headers=auth("bob"))
+    assert r.status_code == 200
+    assert r.json()["session"] is None
+
+    forbidden = await client.get(
+        f"/v1/tenants/{alice_tenant}/sessions/current", headers=auth("bob")
+    )
+    assert forbidden.status_code == 403

@@ -210,7 +210,14 @@ class CloseOut(BaseModel):
 
 
 class ReentryOut(BaseModel):
-    session: SessionOut | None
+    session: SessionOut | None = Field(
+        default=None,
+        description=(
+            "May be `closed` — an atomic park-and-close preserves a continuation "
+            "on a closed session, and `state` is how a client tells that apart "
+            "from a session it can resume."
+        ),
+    )
     parking: ParkingOut | None = Field(
         default=None, description="The newest non-superseded record. The pickup view."
     )
@@ -272,6 +279,14 @@ async def pickup(
     response_model=ReentryOut,
     responses=errors.error_responses(401, 403, 426),
     summary="Re-entry: where was I?",
+    description=(
+        "The authoritative re-entry surface. Returns, in order: the active "
+        "session; otherwise the most recently parked one; otherwise the session "
+        "owning the newest non-superseded parking record **even if that session "
+        "is closed** — which is the state an atomic park-and-close leaves behind. "
+        "Constitution invariant 4 requires the newest parking record to be "
+        "immediately available on re-entry, so a client never reconstructs this."
+    ),
 )
 async def current(ctx: TenantContext = Depends(tenant_context)) -> ReentryOut:
     session = await loop.current_session(ctx.conn, ctx.actor_id)
