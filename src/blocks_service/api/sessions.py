@@ -163,7 +163,15 @@ class ParkingOut(BaseModel):
     created_at: datetime
 
 
-class SessionOut(BaseModel):
+class WorkSessionOut(BaseModel):
+    """Named `WorkSessionOut`, not `SessionOut`.
+
+    `SessionOut` is already the bootstrap response in the **accepted 0.1**
+    contract. Reusing the name collided, and FastAPI disambiguates a collision by
+    mangling BOTH into module-qualified names — which would have silently renamed
+    an accepted schema out from under a client generating against 0.2.
+    """
+
     id: UUID
     project_id: UUID
     physical_block_id: UUID | None = Field(
@@ -210,23 +218,32 @@ class CloseOut(BaseModel):
 
 
 class ReentryOut(BaseModel):
-    session: SessionOut | None = Field(
-        default=None,
+    """Both fields are **required and nullable**, deliberately.
+
+    No-result is `{"session": null, "parking": null}`, never `{}` and never an
+    omitted key. A generated client then has one shape to handle rather than
+    three, and "absent" cannot be confused with "not sent".
+    """
+
+    session: WorkSessionOut | None = Field(
         description=(
             "May be `closed` — an atomic park-and-close preserves a continuation "
             "on a closed session, and `state` is how a client tells that apart "
-            "from a session it can resume."
+            "from a session it can resume. Null when there is nothing to re-enter."
         ),
     )
     parking: ParkingOut | None = Field(
-        default=None, description="The newest non-superseded record. The pickup view."
+        description=(
+            "The newest non-superseded record. The pickup view. Null when the "
+            "session has no continuation, or when there is no session."
+        ),
     )
 
 
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    response_model=SessionOut,
+    response_model=WorkSessionOut,
     responses=errors.error_responses(400, 401, 403, 404, 409, 426),
     summary="Pick up: start a work session",
     description=(
@@ -269,7 +286,7 @@ async def pickup(
             )
         except loop.DomainError as exc:
             raise as_http(exc) from exc
-        return SessionOut(**row).model_dump(mode="json")
+        return WorkSessionOut(**row).model_dump(mode="json")
 
     return await idem.run(status.HTTP_201_CREATED, produce)
 
@@ -280,21 +297,23 @@ async def pickup(
     responses=errors.error_responses(401, 403, 426),
     summary="Re-entry: where was I?",
     description=(
-        "The authoritative re-entry surface. Returns, in order: the active "
-        "session; otherwise the most recently parked one; otherwise the session "
-        "owning the newest non-superseded parking record **even if that session "
-        "is closed** — which is the state an atomic park-and-close leaves behind. "
-        "Constitution invariant 4 requires the newest parking record to be "
-        "immediately available on re-entry, so a client never reconstructs this."
+        "The authoritative re-entry surface. Returns, in order: the **active** "
+        "session; otherwise the session owning the **globally newest "
+        "non-superseded parking record**, whether parked or closed. State does "
+        "not outrank recency — a parked session competes on the age of its own "
+        "record like everything else. Constitution invariant 4 requires the "
+        "newest parking record to be immediately available, so a client never "
+        "reconstructs this. Both fields are required and nullable: no result is "
+        "`{\"session\": null, \"parking\": null}`."
     ),
 )
 async def current(ctx: TenantContext = Depends(tenant_context)) -> ReentryOut:
     session = await loop.current_session(ctx.conn, ctx.actor_id)
     if session is None:
-        return ReentryOut(session=None)
+        return ReentryOut(session=None, parking=None)
     parking = await loop.newest_parking(ctx.conn, session["id"])
     return ReentryOut(
-        session=SessionOut(**session),
+        session=WorkSessionOut(**session),
         parking=ParkingOut(**parking) if parking else None,
     )
 

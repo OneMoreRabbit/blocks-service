@@ -188,3 +188,41 @@ def test_a_historical_payload_validates_against_its_own_stamped_version():
     jsonschema.validate(old_payload, events.load_schema("project.created", "0.1"))
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(old_payload, events.load_schema("project.created", "0.2"))
+
+
+def test_no_schema_name_is_module_mangled(spec):
+    """A model-name collision renames BOTH sides, including accepted ones.
+
+    `SessionOut` is the bootstrap response published in accepted 0.1. When 0.2
+    reused the name for work sessions, FastAPI disambiguated by mangling both
+    into module-qualified names — silently renaming an accepted schema out from
+    under any client generating against 0.2.
+    """
+    mangled = [name for name in spec["components"]["schemas"] if "__" in name]
+    assert not mangled, f"model-name collision mangled: {mangled}"
+
+
+def test_the_accepted_0_1_schema_names_survive_in_0_2(spec):
+    """0.2 is additive; a name a consumer already generated from must not move."""
+    import json
+    import pathlib
+
+    published = pathlib.Path(
+        ".atlas/components/blocks-service/docs/provides/blocks-service-api-openapi-v0_1.json"
+    )
+    if not published.exists():
+        pytest.skip("0.1 artefact not present in this checkout")
+    accepted = set(json.loads(published.read_text())["components"]["schemas"])
+    # FastAPI's own validation schemas are not part of the contract.
+    accepted -= {"HTTPValidationError", "ValidationError"}
+    assert accepted <= set(spec["components"]["schemas"])
+
+
+def test_the_reentry_result_is_required_and_nullable(spec):
+    """No-result must be nulls, never `{}` or omitted keys."""
+    reentry = spec["components"]["schemas"]["ReentryOut"]
+    assert set(reentry["required"]) == {"session", "parking"}
+    for field in ("session", "parking"):
+        assert any(
+            option.get("type") == "null" for option in reentry["properties"][field]["anyOf"]
+        ), field

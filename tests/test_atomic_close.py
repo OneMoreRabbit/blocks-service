@@ -365,3 +365,61 @@ async def test_re_entry_never_crosses_a_tenant(client, auth):
         f"/v1/tenants/{alice_tenant}/sessions/current", headers=auth("bob")
     )
     assert forbidden.status_code == 403
+
+
+async def test_a_newer_closed_continuation_beats_an_older_parked_session(client, auth):
+    """The precedence defect, asserted directly.
+
+    Park session A, then atomically park-and-close session B. An order that puts
+    `parked` above the fallback returns A on state alone — hiding B's newer
+    record, which is exactly the record invariant 4 promises. State is not
+    recency.
+    """
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+
+    a = await _session(client, auth, tenant, project)
+    parked = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{a['id']}/park",
+        headers={**auth("alice"), "If-Match": str(a["row_version"])},
+        json={**CONTINUATION, "next_physical_action": "older parked action"},
+    )
+    assert parked.status_code == 200
+
+    b = await _session(client, auth, tenant, project)
+    closed = await client.post(
+        f"/v1/tenants/{tenant}/sessions/{b['id']}/close",
+        headers={**auth("alice"), "If-Match": str(b["row_version"])},
+        json={**CONTINUATION, "next_physical_action": "newer closed action"},
+    )
+    assert closed.json()["state"] == "closed"
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["session"]["id"] == b["id"], "the newer record must win, not the parked state"
+    assert r.json()["parking"]["next_physical_action"] == "newer closed action"
+
+
+async def test_an_active_session_still_outranks_a_newer_closed_record(client, auth):
+    """Active is where the person actually is, and stays first."""
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+
+    done = await _session(client, auth, tenant, project)
+    await client.post(
+        f"/v1/tenants/{tenant}/sessions/{done['id']}/close",
+        headers={**auth("alice"), "If-Match": str(done["row_version"])},
+        json=CONTINUATION,
+    )
+    live = await _session(client, auth, tenant, project)
+
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.json()["session"]["id"] == live["id"]
+    assert r.json()["session"]["state"] == "active"
+
+
+async def test_no_result_is_explicit_nulls_not_an_empty_object(client, auth):
+    """Generation-safe: one shape to handle, not three."""
+    tenant = await _tenant(client, auth)
+    r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))
+    assert r.status_code == 200
+    assert r.json() == {"session": None, "parking": None}

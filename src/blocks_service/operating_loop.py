@@ -743,51 +743,50 @@ async def current_session(conn: psycopg.AsyncConnection, actor_id: UUID) -> dict
 
     Constitution invariant 2 -- restarting after time away must require no audit
     -- and invariant 4 -- *re-entry must make the newest parking record
-    immediately available*. The second is why this does not stop at `active` and
-    `parked`.
+    immediately available*.
 
-    An atomic park-and-close leaves the session `closed` with a continuation
-    attached. Excluding closed sessions here would mean the one thing invariant 4
-    guarantees -- the newest parking record, immediately -- would be the one thing
-    a client could not see after the most common offline boundary. So:
+    1. the active session, if there is one. At most one exists per user, and it
+       is where the person actually is;
+    2. otherwise the session owning the **globally newest non-superseded parking
+       record**, whether that session is parked or closed.
 
-    1. the active session, if there is one;
-    2. otherwise the most recently parked session;
-    3. otherwise the session owning the newest non-superseded parking record,
-       whatever state it is in.
+    Step 2 deliberately does not privilege `parked` over `closed`. An earlier
+    version did, and it was wrong: park session A, then atomically park-and-close
+    session B, and A would win on state alone while hiding B's newer record --
+    which is precisely the record invariant 4 promises. State is not recency, and
+    only recency was ever the question here.
 
-    Step 3 is bounded by the record existing: a session closed with an outcome
-    tier and no continuation has nothing to return, and correctly returns nothing.
+    A parked session always has at least one record (parking appends one), so
+    dropping the state tier loses nothing: a parked session competes on the age of
+    its own record, like everything else. A session closed on a completed outcome
+    tier has no record and correctly never appears.
     """
     cur = await conn.execute(
         f"select {_SESSION_COLUMNS}"
         " from blocks.work_sessions"
-        " where started_by_user_id = %s and state in ('active', 'parked')"
-        " order by (state = 'active') desc, coalesce(parked_at, started_at) desc"
+        " where started_by_user_id = %s and state = 'active'"
         " limit 1",
         (actor_id,),
     )
-    live = await cur.fetchone()
-    if live is not None:
-        return live
+    active = await cur.fetchone()
+    if active is not None:
+        return active
 
-    # Nothing live. Fall back to whichever session owns the newest parking record
-    # that has not been superseded -- which is what invariant 4 actually names.
     cur = await conn.execute(
         f"select {_SESSION_COLUMNS}"
         " from blocks.work_sessions w"
-        " where w.started_by_user_id = %s"
-        "   and exists ("
-        "     select 1 from blocks.parking_records p"
-        "     where p.work_session_id = w.id"
-        "       and not exists ("
-        "         select 1 from blocks.parking_records s where s.supersedes_id = p.id"
-        "       )"
-        "   )"
-        " order by ("
-        "   select max(p.created_at) from blocks.parking_records p"
+        " join lateral ("
+        "   select p.created_at, p.sequence"
+        "   from blocks.parking_records p"
         "   where p.work_session_id = w.id"
-        " ) desc"
+        "     and not exists ("
+        "       select 1 from blocks.parking_records s where s.supersedes_id = p.id"
+        "     )"
+        "   order by p.created_at desc, p.sequence desc"
+        "   limit 1"
+        " ) newest on true"
+        " where w.started_by_user_id = %s"
+        " order by newest.created_at desc, newest.sequence desc, w.started_at desc"
         " limit 1",
         (actor_id,),
     )
