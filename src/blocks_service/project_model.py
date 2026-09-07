@@ -48,11 +48,13 @@ async def get_project(conn: psycopg.AsyncConnection, project_id: UUID) -> dict:
 
 
 async def create_project(conn: psycopg.AsyncConnection, tenant_id: UUID, name: str) -> dict:
-    """Create a project and its empty notes document in one transaction.
+    """Create a project. Its empty notes document arrives with it.
 
-    The notes row exists from the start so that reading notes on a fresh project
-    is a plain read of an empty document rather than a special case every client
-    has to know about.
+    The notes row is a database invariant (`projects_ensure_notes`, migration
+    0008) rather than something this function remembers to do. That is deliberate:
+    during the window between migration and image cutover the pre-0.3 writer is
+    still live and inserts projects without notes, so the guarantee has to hold
+    for writers this code knows nothing about.
     """
     cur = await conn.execute(
         "insert into blocks.projects (tenant_id, name) values (%s, %s)"
@@ -61,10 +63,9 @@ async def create_project(conn: psycopg.AsyncConnection, tenant_id: UUID, name: s
     )
     row = await cur.fetchone()
     assert row is not None
-    await conn.execute(
-        "insert into blocks.project_notes (tenant_id, project_id) values (%s, %s)",
-        (tenant_id, row["id"]),
-    )
+    # The notes row is created by the `projects_ensure_notes` trigger (0008), not
+    # here. One place owns the invariant, and it is the place that also covers the
+    # pre-0.3 writer still running between migration and cutover.
     await events.emit(
         conn,
         tenant_id=tenant_id,

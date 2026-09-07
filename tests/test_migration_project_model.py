@@ -19,7 +19,9 @@ from psycopg.rows import dict_row
 
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
-TARGET = next(m for m in MIGRATIONS if m.stem.startswith("0007"))
+EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008"))]
+TARGET = EXPAND[0]        # 0007 — the relation
+INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 SCRATCH = "blocks_migration_drill"
 
 
@@ -109,11 +111,46 @@ def _snapshot(dbname: str) -> list[dict]:
     return rows
 
 
-def _migrate(dbname: str) -> None:
+def _apply(dbname: str, migration: pathlib.Path) -> None:
     with psycopg.connect(_dsn(dbname), autocommit=False) as conn:
         conn.execute("set role blocks_owner")
-        conn.execute(TARGET.read_text())
+        conn.execute(migration.read_text())
         conn.commit()
+
+
+def _migrate(dbname: str) -> None:
+    """The whole expand step, as it deploys: 0007 then 0008."""
+    for migration in EXPAND:
+        _apply(dbname, migration)
+
+
+def _legacy_create_project(dbname: str, name: str) -> tuple[str, str]:
+    """Insert a project the way the PRE-0.3 writer does: the project row only.
+
+    This is the writer that stays live between migration and image cutover. It
+    knows nothing about notes, so it is the exact shape that reintroduces the
+    missing-row failure.
+    """
+    with psycopg.connect(_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.projects no force row level security")
+        # project_notes too, once 0008 exists: the trigger's insert runs under the
+        # caller's own policies, so an out-of-band insert with no tenant context
+        # is refused. The real pre-0.3 API inserts inside a tenant-scoped
+        # transaction and satisfies the policy; only an administrative insert like
+        # this one has to make the exemption explicit.
+        conn.execute("alter table blocks.project_notes no force row level security")
+        tenant = conn.execute(
+            "select tenant_id from blocks.projects limit 1"
+        ).fetchone()["tenant_id"]
+        row = conn.execute(
+            "insert into blocks.projects (tenant_id, name) values (%s, %s)"
+            " returning id, tenant_id",
+            (tenant, name),
+        ).fetchone()
+        conn.execute("alter table blocks.project_notes force row level security")
+        conn.execute("alter table blocks.projects force row level security")
+    return str(row["id"]), str(row["tenant_id"])
 
 
 def test_the_migration_preserves_every_parking_row_identically(legacy_db):
@@ -237,7 +274,7 @@ def test_forced_rls_is_restored_after_the_migration(legacy_db):
         assert row["relrowsecurity"] and row["relforcerowsecurity"], row["relname"]
 
 
-def test_the_migration_gives_every_legacy_project_exactly_one_empty_notes_row(legacy_db):
+def test_the_expand_step_gives_every_legacy_project_exactly_one_empty_notes_row(legacy_db):
     """Structural state, not fabricated content.
 
     This test previously asserted the opposite, on the reasoning that creating
@@ -396,3 +433,160 @@ async def test_a_migrated_tenant_cannot_read_the_other_tenants_project(legacy_db
                 f"/v1/tenants/{alice_tenant}/projects", headers=auth("bob")
             )
             assert forbidden.status_code == 403
+
+
+# --------------------------------------------------------------------------
+# The cutover window: the pre-0.3 writer is live across it
+# --------------------------------------------------------------------------
+#
+# The deployment contract runs migrations BEFORE switching the image and does not
+# stop the old API first. So a project can be created by the project-only writer
+# after 0007 and before 0008, and after 0008 while the old image is still serving.
+# Both boundaries have to be safe.
+
+
+async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_db, auth):
+    """Boundary (a): the row that slipped through, repaired by the catch-up."""
+    from httpx import ASGITransport, AsyncClient
+
+    from blocks_service.app import create_app
+    from blocks_service.config import Environment, IdentityMode, Settings
+    from tests.conftest import APP_PASSWORD, DEV_SECRET, MIGRATOR_PASSWORD
+
+    _apply(legacy_db, TARGET)                       # 0007 only
+    project_id, tenant = _legacy_create_project(legacy_db, "created mid-cutover")
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.project_notes no force row level security")
+        orphan = conn.execute(
+            "select count(*) as n from blocks.project_notes where project_id = %s",
+            (project_id,),
+        ).fetchone()["n"]
+        conn.execute("alter table blocks.project_notes force row level security")
+    assert orphan == 0, "precondition: the legacy writer creates no notes row"
+
+    _apply(legacy_db, INVARIANT)                    # 0008 heals it
+
+    settings = Settings(
+        env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
+        db_migrator_password=MIGRATOR_PASSWORD, identity_mode=IdentityMode.dev,
+        dev_token_secret=DEV_SECRET,
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://cutover.test"
+        ) as client:
+            await client.post("/v1/session", headers=auth("alice"))
+            page = await client.get(
+                f"/v1/tenants/{tenant}/projects/{project_id}", headers=auth("alice")
+            )
+            assert page.status_code == 200, "a project created mid-cutover must open"
+            assert page.json()["notes"]["body"] == ""
+
+            saved = await client.put(
+                f"/v1/tenants/{tenant}/projects/{project_id}/notes",
+                headers={**auth("alice"), "If-Match": "1"},
+                json={"body": "first note after the cutover window"},
+            )
+            assert saved.status_code == 200
+            assert saved.json()["row_version"] == 2
+
+
+async def test_a_project_created_by_the_legacy_writer_after_0008_gets_its_row(legacy_db, auth):
+    """Boundary (b): the trigger covers a writer that knows nothing about notes."""
+    from httpx import ASGITransport, AsyncClient
+
+    from blocks_service.app import create_app
+    from blocks_service.config import Environment, IdentityMode, Settings
+    from tests.conftest import APP_PASSWORD, DEV_SECRET, MIGRATOR_PASSWORD
+
+    _migrate(legacy_db)                             # 0007 + 0008
+    project_id, tenant = _legacy_create_project(legacy_db, "created by the old image")
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.project_notes no force row level security")
+        rows = conn.execute(
+            "select tenant_id, body, row_version from blocks.project_notes"
+            " where project_id = %s",
+            (project_id,),
+        ).fetchall()
+        conn.execute("alter table blocks.project_notes force row level security")
+
+    assert len(rows) == 1, "exactly one notes row, created automatically"
+    assert rows[0]["body"] == ""
+    assert rows[0]["row_version"] == 1
+    assert str(rows[0]["tenant_id"]) == tenant, "the trigger must not cross a tenant"
+
+    settings = Settings(
+        env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
+        db_migrator_password=MIGRATOR_PASSWORD, identity_mode=IdentityMode.dev,
+        dev_token_secret=DEV_SECRET,
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://cutover.test"
+        ) as client:
+            await client.post("/v1/session", headers=auth("alice"))
+            page = await client.get(
+                f"/v1/tenants/{tenant}/projects/{project_id}", headers=auth("alice")
+            )
+            assert page.status_code == 200
+            saved = await client.put(
+                f"/v1/tenants/{tenant}/projects/{project_id}/notes",
+                headers={**auth("alice"), "If-Match": "1"}, json={"body": "works"},
+            )
+            assert saved.status_code == 200
+
+
+def test_the_invariant_migration_restores_forced_rls(legacy_db):
+    """0008 lifts FORCE on two tables for its sweep; leaving it off is a breach."""
+    _migrate(legacy_db)
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        rows = conn.execute(
+            "select relname, relrowsecurity, relforcerowsecurity from pg_class"
+            " where relnamespace = 'blocks'::regnamespace and relkind = 'r'"
+            "   and relname in ('projects','project_notes')"
+        ).fetchall()
+    assert rows
+    for row in rows:
+        assert row["relrowsecurity"] and row["relforcerowsecurity"], row["relname"]
+
+
+def test_the_trigger_is_not_security_definer(legacy_db):
+    """It must run as the inserting role, under that role's own policies.
+
+    A SECURITY DEFINER trigger here would be a standing way to write a notes row
+    into a tenant the caller could not otherwise reach.
+    """
+    _migrate(legacy_db)
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        row = conn.execute(
+            "select prosecdef from pg_proc where proname = 'ensure_project_notes'"
+        ).fetchone()
+    assert row is not None, "the invariant function is missing"
+    assert row["prosecdef"] is False
+
+
+def test_the_invariant_fails_closed_without_a_tenant_context(legacy_db):
+    """A project cannot be created where its notes row cannot be.
+
+    The trigger runs under the inserting role's policies, so an insert with no
+    tenant context is refused rather than producing a project with no notes row.
+    Fail-closed and loud is the right outcome: the alternative is the exact
+    silent state this whole migration exists to prevent.
+    """
+    _migrate(legacy_db)
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.projects no force row level security")
+        tenant = conn.execute("select tenant_id from blocks.projects limit 1").fetchone()["tenant_id"]
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute(
+                "insert into blocks.projects (tenant_id, name) values (%s, 'no context')",
+                (tenant,),
+            )
+        conn.execute("alter table blocks.projects force row level security")
