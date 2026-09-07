@@ -420,15 +420,21 @@ async def _append_parking(
         (session_id,),
     )
     sequence = (await cur.fetchone())["n"]
+    # project_id is derived from the session rather than passed in: parking now
+    # belongs to a project (ADR-0009), and a 0.2 client knows nothing about that.
+    # Deriving it here is what keeps the 0.2 endpoints working through the
+    # declared compatibility window instead of failing on a NOT NULL they cannot
+    # see.
     cur = await conn.execute(
         "insert into blocks.parking_records"
-        " (tenant_id, work_session_id, where_i_am, next_physical_action, must_not_forget,"
-        "  authored_by_user_id, device_id, sequence)"
-        " values (%s, %s, %s, %s, %s, %s, %s, %s)"
+        " (tenant_id, work_session_id, project_id, where_i_am, next_physical_action,"
+        "  must_not_forget, authored_by_user_id, device_id, sequence)"
+        " select %s, %s, w.project_id, %s, %s, %s, %s, %s, %s"
+        "   from blocks.work_sessions w where w.id = %s"
         " returning id, where_i_am, next_physical_action, must_not_forget, sequence, created_at",
         (
             tenant_id, session_id, where_i_am, next_physical_action, must_not_forget,
-            actor_id, device_id, sequence,
+            actor_id, device_id, sequence, session_id,
         ),
     )
     record = await cur.fetchone()

@@ -317,12 +317,15 @@ async def test_a_superseded_record_is_not_offered_at_re_entry(client, auth, db: 
     # linked by supersedes_id — the API for that is not built yet, so this
     # exercises the query the way the data model intends.
     async with db.tenant_transaction(tenant, actor) as conn:
+        # project_id is now required and canonical (ADR-0009); derive it from the
+        # session exactly as the 0.2 write path does.
         await conn.execute(
-            "insert into blocks.parking_records (tenant_id, work_session_id, where_i_am,"
-            " next_physical_action, must_not_forget, authored_by_user_id, sequence,"
-            " supersedes_id) values (%s, %s, 'corrected', 'the corrected action',"
-            " 'corrected note', %s, 2, %s)",
-            (tenant, session["id"], actor, original),
+            "insert into blocks.parking_records (tenant_id, work_session_id, project_id,"
+            " where_i_am, next_physical_action, must_not_forget, authored_by_user_id,"
+            " sequence, supersedes_id)"
+            " select %s, %s, w.project_id, 'corrected', 'the corrected action',"
+            " 'corrected note', %s, 2, %s from blocks.work_sessions w where w.id = %s",
+            (tenant, session["id"], actor, original, session["id"]),
         )
 
     r = await client.get(f"/v1/tenants/{tenant}/sessions/current", headers=auth("alice"))

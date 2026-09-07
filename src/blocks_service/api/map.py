@@ -17,7 +17,7 @@ from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
 from .deps import TenantContext, as_http, idempotency, if_match_version, tenant_context
 
-router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects/{project_id}/map", tags=["map"])
+router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects/{project_id}/map", tags=["map-0.2-legacy"])
 
 
 class MapItemIn(BaseModel):

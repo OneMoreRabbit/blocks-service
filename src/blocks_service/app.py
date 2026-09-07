@@ -11,7 +11,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .api import blocks, changes, health, map as map_api, projects, session, sessions
+from .api import blocks, changes, health, map as map_api, project_model, session, sessions
 from .api.deps import require_supported_client
 from .config import Settings, get_settings
 from .errors import ErrorCode
@@ -85,7 +85,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # bootstrap are not: a client that is too old must still be able to reach a
     # readiness probe and learn *why* it is being refused.
     gated = [Depends(require_supported_client)]
-    app.include_router(projects.router, dependencies=gated)
+    # 0.3 replaces 0.2's project endpoints on the same paths. Its response is a
+    # superset of 0.2's, so an installed 0.2 client keeps working through the
+    # declared compatibility window (ADR-0009).
+    app.include_router(project_model.router, dependencies=gated)
     app.include_router(blocks.router, dependencies=gated)
     app.include_router(map_api.router, dependencies=gated)
     app.include_router(sessions.router, dependencies=gated)

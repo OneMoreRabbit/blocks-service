@@ -31,7 +31,7 @@ from .deps import (
     tenant_context,
 )
 
-router = APIRouter(prefix="/v1/tenants/{tenant_id}/sessions", tags=["sessions"])
+router = APIRouter(prefix="/v1/tenants/{tenant_id}/sessions", tags=["sessions-0.2-legacy"])
 
 
 class _PickupCommon(BaseModel):

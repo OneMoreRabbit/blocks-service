@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-archived-v0_1.schema.json",
+  "title": "project.archived 0.1",
+  "description": "A project was archived \u2014 hidden from the dashboard, never deleted. Identifiers and routing metadata only: notes bodies and parking answers are never placed in an event payload, because payloads travel through transports and sinks this service does not control. Read the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "projectId"
+  ],
+  "properties": {
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

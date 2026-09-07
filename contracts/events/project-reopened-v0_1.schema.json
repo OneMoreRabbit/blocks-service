@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-reopened-v0_1.schema.json",
+  "title": "project.reopened 0.1",
+  "description": "An archived project was restored to the dashboard. Identifiers and routing metadata only: notes bodies and parking answers are never placed in an event payload, because payloads travel through transports and sinks this service does not control. Read the resource.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "projectId"
+  ],
+  "properties": {
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

@@ -127,7 +127,7 @@ def test_no_success_response_is_untyped_and_no_422_is_advertised(spec):
 
 
 def test_the_document_version_matches_the_contract(spec):
-    assert spec["info"]["version"] == "0.2.0"
+    assert spec["info"]["version"] == "0.3.0"
 
 
 # --------------------------------------------------------------------------

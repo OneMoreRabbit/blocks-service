@@ -27,6 +27,12 @@ EVENT_VERSIONS: Final[dict[str, str]] = {
     "project.created": "0.2",
     "block.bound": "0.1",
     "block.unbound": "0.1",
+    # The project model (ADR-0009). Identifiers and routing metadata only.
+    "project.renamed": "0.1",
+    "project.archived": "0.1",
+    "project.reopened": "0.1",
+    "project.notes_saved": "0.1",
+    "project.parked": "0.1",
     "session.started": "0.1",
     "session.parked": "0.1",
     "session.resumed": "0.1",
