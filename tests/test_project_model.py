@@ -406,3 +406,77 @@ async def test_notes_cannot_be_written_across_a_tenant_by_foreign_key(client, au
                 " values (%s, %s, 'planted')",
                 (bob_tenant, project["id"]),
             )
+
+
+# --------------------------------------------------------------------------
+# Idempotent creation — the brief requires it for retryable creates, not only
+# appends, and a duplicate project is a worse outcome than a duplicate park.
+# --------------------------------------------------------------------------
+
+
+async def test_a_replayed_project_creation_creates_one_project(client, auth):
+    tenant = await _tenant(client, auth)
+    headers = {**auth("alice"), "Idempotency-Key": "queued-create-1"}
+    body = {"name": "Kitchen rewire"}
+
+    first = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
+    second = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
+
+    assert first.status_code == second.status_code == 201
+    assert first.json() == second.json(), "the replay must return the stored result"
+    assert second.headers.get("Idempotent-Replay") == "true"
+
+    listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+    assert [p["id"] for p in listed.json()] == [first.json()["id"]]
+
+
+async def test_a_replayed_creation_does_not_create_a_second_notes_row(client, auth, db: Database):
+    """Creation writes a project AND its notes; a replay must duplicate neither."""
+    tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    headers = {**auth("alice"), "Idempotency-Key": "queued-create-1"}
+    body = {"name": "Kitchen rewire"}
+
+    await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
+    await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute("select count(*) as n from blocks.project_notes")
+        notes = (await cur.fetchone())["n"]
+        cur = await conn.execute("select count(*) as n from blocks.outbox where event_type = 'project.created'")
+        events = (await cur.fetchone())["n"]
+    assert notes == 1
+    assert events == 1, "a replay must not re-announce the creation"
+
+
+async def test_the_same_creation_key_with_a_different_name_is_refused(client, auth):
+    tenant = await _tenant(client, auth)
+    headers = {**auth("alice"), "Idempotency-Key": "queued-create-1"}
+
+    assert (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=headers, json={"name": "Kitchen"}
+    )).status_code == 201
+
+    clash = await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=headers, json={"name": "Loft"}
+    )
+    assert clash.status_code == 409
+    assert clash.json()["error"]["code"] == "conflict"
+
+
+async def test_a_creation_replay_is_scoped_to_its_tenant(client, auth):
+    """The same key in another tenant is a different operation, not a replay."""
+    alice_tenant = await _tenant(client, auth, "alice")
+    bob_tenant = await _tenant(client, auth, "bob")
+    body = {"name": "Kitchen rewire"}
+
+    a = await client.post(
+        f"/v1/tenants/{alice_tenant}/projects",
+        headers={**auth("alice"), "Idempotency-Key": "shared-key"}, json=body,
+    )
+    b = await client.post(
+        f"/v1/tenants/{bob_tenant}/projects",
+        headers={**auth("bob"), "Idempotency-Key": "shared-key"}, json=body,
+    )
+    assert a.status_code == b.status_code == 201
+    assert a.json()["id"] != b.json()["id"]

@@ -62,6 +62,34 @@ create table blocks.project_notes (
 comment on table blocks.project_notes is
   'One notes document per project, saved explicitly (never autosaved into a conflict). row_version carries optimistic concurrency; body is user-authored text and must never reach an event payload or a log.';
 
+-- Backfill one EMPTY notes row per existing project.
+--
+-- An empty row is structural state -- "this project has no note yet" -- not
+-- fabricated content. Without it every project that predates this migration
+-- returns 404 on its page and can never take a first note, because the save path
+-- UPDATEs an existing row and there is nothing to update. A project created after
+-- this migration gets its row at creation; a project created before gets it here,
+-- and the two are then indistinguishable, which is the point.
+--
+-- FORCE has to come off for the same reason as the parking backfill: a migration
+-- has no tenant context, so the INSERT ... SELECT reads zero projects with it on.
+-- tenant_id is carried from the project row, so isolation is preserved by the
+-- data rather than by the policy being active during the copy -- and the
+-- composite foreign key makes a cross-tenant pairing unwritable regardless.
+alter table blocks.projects      no force row level security;
+alter table blocks.project_notes no force row level security;
+
+insert into blocks.project_notes (tenant_id, project_id)
+select p.tenant_id, p.id
+  from blocks.projects p
+ where not exists (
+   select 1 from blocks.project_notes n
+    where n.tenant_id = p.tenant_id and n.project_id = p.id
+ );
+
+alter table blocks.project_notes force row level security;
+alter table blocks.projects      force row level security;
+
 -- ---------------------------------------------------------------------------
 -- Parking belongs to a project
 -- ---------------------------------------------------------------------------

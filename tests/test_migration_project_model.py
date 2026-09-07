@@ -13,6 +13,8 @@ from collections.abc import Iterator
 
 import psycopg
 import pytest
+
+from blocks_service.identity import DEV_ISSUER
 from psycopg.rows import dict_row
 
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
@@ -63,7 +65,8 @@ def _seed(conn) -> None:
     conn.execute("alter table blocks.projects no force row level security")
     for who in ("alice", "bob"):
         user = conn.execute(
-            "insert into blocks.users (issuer, subject) values ('i', %s) returning id", (who,)
+            "insert into blocks.users (issuer, subject) values (%s, %s) returning id",
+            (DEV_ISSUER, who),
         ).fetchone()[0]
         tenant = conn.execute(
             "insert into blocks.tenants (kind, name, personal_for) values ('personal', %s, %s)"
@@ -234,15 +237,162 @@ def test_forced_rls_is_restored_after_the_migration(legacy_db):
         assert row["relrowsecurity"] and row["relforcerowsecurity"], row["relname"]
 
 
-def test_the_migration_creates_no_project_notes_for_legacy_projects(legacy_db):
-    """Notes are created with a project; migrating must not invent documents.
+def test_the_migration_gives_every_legacy_project_exactly_one_empty_notes_row(legacy_db):
+    """Structural state, not fabricated content.
 
-    Legacy projects predate notes, so reading their notes is a miss until someone
-    saves. Fabricating rows would be inventing data the brief forbids.
+    This test previously asserted the opposite, on the reasoning that creating
+    rows was inventing data. That was wrong: without the row a migrated project
+    404s on its page and can never take a first note, because the save path
+    UPDATEs and finds nothing. An empty row means "no note yet" — which is
+    precisely true of a project that has never had one.
     """
     _migrate(legacy_db)
     with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
         conn.execute("set role blocks_owner")
         conn.execute("alter table blocks.project_notes no force row level security")
-        n = conn.execute("select count(*) as n from blocks.project_notes").fetchone()["n"]
-    assert n == 0
+        conn.execute("alter table blocks.projects no force row level security")
+        rows = conn.execute(
+            "select n.tenant_id, n.project_id, n.body, n.row_version,"
+            "       p.tenant_id as project_tenant"
+            "  from blocks.project_notes n"
+            "  join blocks.projects p on p.id = n.project_id"
+        ).fetchall()
+        projects = conn.execute("select count(*) as n from blocks.projects").fetchone()["n"]
+
+    assert len(rows) == projects, "exactly one notes row per project"
+    for row in rows:
+        assert row["body"] == "", "backfilled notes must be empty, not invented"
+        assert row["row_version"] == 1
+        assert row["tenant_id"] == row["project_tenant"], "notes must not cross a tenant"
+
+
+def test_the_notes_backfill_is_idempotent(legacy_db):
+    """Re-running must not produce a second row, or violate the primary key."""
+    _migrate(legacy_db)
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.projects no force row level security")
+        conn.execute("alter table blocks.project_notes no force row level security")
+        before = conn.execute("select count(*) as n from blocks.project_notes").fetchone()["n"]
+        conn.execute(
+            "insert into blocks.project_notes (tenant_id, project_id)"
+            " select p.tenant_id, p.id from blocks.projects p"
+            " where not exists (select 1 from blocks.project_notes n"
+            "   where n.tenant_id = p.tenant_id and n.project_id = p.id)"
+        )
+        after = conn.execute("select count(*) as n from blocks.project_notes").fetchone()["n"]
+        conn.execute("alter table blocks.project_notes force row level security")
+        conn.execute("alter table blocks.projects force row level security")
+    assert before == after
+
+
+# --------------------------------------------------------------------------
+# The migrated database, exercised through the real API
+# --------------------------------------------------------------------------
+
+
+async def test_a_migrated_project_opens_and_takes_its_first_note(legacy_db, auth):
+    """The blocker, end to end.
+
+    Without a backfilled notes row a migrated project 404s on its page and can
+    never take a first note, because the save path UPDATEs and finds nothing.
+    This drives the real API against a database that was migrated from pre-0007,
+    which is the only way to catch that.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from blocks_service.app import create_app
+    from blocks_service.config import Environment, IdentityMode, Settings
+    from tests.conftest import APP_PASSWORD, DEV_SECRET, MIGRATOR_PASSWORD
+
+    _migrate(legacy_db)
+
+    settings = Settings(
+        env=Environment.test,
+        db_name=legacy_db,
+        db_app_password=APP_PASSWORD,
+        db_migrator_password=MIGRATOR_PASSWORD,
+        identity_mode=IdentityMode.dev,
+        dev_token_secret=DEV_SECRET,
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://migrated.test"
+        ) as client:
+            session = (await client.post("/v1/session", headers=auth("alice"))).json()
+            tenant = session["personal_tenant_id"]
+
+            listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+            assert listed.status_code == 200
+            legacy = [p for p in listed.json() if p["name"] == "alice project"]
+            assert legacy, "the migrated project is missing from the dashboard"
+            project_id = legacy[0]["id"]
+
+            page = await client.get(
+                f"/v1/tenants/{tenant}/projects/{project_id}", headers=auth("alice")
+            )
+            assert page.status_code == 200, "a migrated project must open"
+            assert page.json()["notes"]["body"] == ""
+            assert page.json()["notes"]["row_version"] == 1
+
+            # Its legacy parking came across and is readable on the new surface.
+            assert page.json()["newest_parking"] is not None
+            history = await client.get(
+                f"/v1/tenants/{tenant}/projects/{project_id}/parking", headers=auth("alice")
+            )
+            assert len(history.json()) == 2, "both legacy sessions' records, on the project"
+
+            saved = await client.put(
+                f"/v1/tenants/{tenant}/projects/{project_id}/notes",
+                headers={**auth("alice"), "If-Match": "1"},
+                json={"body": "first note on a migrated project"},
+            )
+            assert saved.status_code == 200, "the first save on a migrated project must succeed"
+            assert saved.json()["row_version"] == 2
+
+            reread = await client.get(
+                f"/v1/tenants/{tenant}/projects/{project_id}/notes", headers=auth("alice")
+            )
+            assert reread.json()["body"] == "first note on a migrated project"
+
+
+async def test_a_migrated_tenant_cannot_read_the_other_tenants_project(legacy_db, auth):
+    """Isolation survives the migration, on data that predates every policy change."""
+    from httpx import ASGITransport, AsyncClient
+
+    from blocks_service.app import create_app
+    from blocks_service.config import Environment, IdentityMode, Settings
+    from tests.conftest import APP_PASSWORD, DEV_SECRET, MIGRATOR_PASSWORD
+
+    _migrate(legacy_db)
+    settings = Settings(
+        env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
+        db_migrator_password=MIGRATOR_PASSWORD, identity_mode=IdentityMode.dev,
+        dev_token_secret=DEV_SECRET,
+    )
+    app = create_app(settings)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://migrated.test"
+        ) as client:
+            alice_tenant = (
+                await client.post("/v1/session", headers=auth("alice"))
+            ).json()["personal_tenant_id"]
+            bob_tenant = (
+                await client.post("/v1/session", headers=auth("bob"))
+            ).json()["personal_tenant_id"]
+
+            alice_projects = await client.get(
+                f"/v1/tenants/{alice_tenant}/projects", headers=auth("alice")
+            )
+            bob_projects = await client.get(
+                f"/v1/tenants/{bob_tenant}/projects", headers=auth("bob")
+            )
+            assert {p["name"] for p in alice_projects.json()} == {"alice project"}
+            assert {p["name"] for p in bob_projects.json()} == {"bob project"}
+
+            forbidden = await client.get(
+                f"/v1/tenants/{alice_tenant}/projects", headers=auth("bob")
+            )
+            assert forbidden.status_code == 403
