@@ -45,14 +45,15 @@ async def _expire_results(db: Database, tenant: str, actor: str) -> int:
 async def test_create_with_a_client_id_replays_from_the_stored_result(client, auth):
     tenant = await _tenant(client, auth)
     pid, key = str(uuid.uuid4()), "op-" + uuid.uuid4().hex[:8]
-    body = {"id": pid, "name": "Kitchen rewire"}
+    body = {"client_id": pid, "name": "Kitchen rewire"}
     headers = {**auth("alice"), "Idempotency-Key": key}
 
     first = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
     second = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
 
     assert first.status_code == 201
-    assert first.json()["id"] == pid, "the client's id must be canonical"
+    assert first.json()["client_id"] == pid, "the client's own identifier comes back"
+    assert first.json()["id"] != pid, "the canonical id stays server-generated"
     assert second.status_code == 201, "a retained result replays its original response"
     assert second.json() == first.json()
     assert second.headers.get("Idempotent-Replay") == "true"
@@ -66,7 +67,7 @@ async def test_create_replays_by_resource_identity_after_the_result_expires(
     tenant = await _tenant(client, auth)
     actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
     pid, key = str(uuid.uuid4()), "op-" + uuid.uuid4().hex[:8]
-    body = {"id": pid, "name": "Kitchen rewire"}
+    body = {"client_id": pid, "name": "Kitchen rewire"}
     headers = {**auth("alice"), "Idempotency-Key": key}
 
     first = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
@@ -75,12 +76,12 @@ async def test_create_replays_by_resource_identity_after_the_result_expires(
 
     replay = await client.post(f"/v1/tenants/{tenant}/projects", headers=headers, json=body)
     assert replay.status_code == 200, "nothing was created, so not 201"
-    assert replay.json()["id"] == pid
+    assert replay.json()["client_id"] == pid
     assert replay.headers.get("Idempotent-Replay") == "true"
     assert replay.headers.get("Idempotent-Replay-Source") == "resource"
 
     listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
-    assert [p["id"] for p in listed.json()] == [pid], "exactly one project, no duplicate"
+    assert [p["client_id"] for p in listed.json()] == [pid], "exactly one project, no duplicate"
 
 
 async def test_reusing_a_client_id_for_a_different_operation_conflicts(
@@ -94,7 +95,7 @@ async def test_reusing_a_client_id_for_a_different_operation_conflicts(
     original = await client.post(
         f"/v1/tenants/{tenant}/projects",
         headers={**auth("alice"), "Idempotency-Key": "op-a"},
-        json={"id": pid, "name": "Kitchen rewire"},
+        json={"client_id": pid, "name": "Kitchen rewire"},
     )
     assert original.status_code == 201
     await _expire_results(db, tenant, actor)
@@ -106,12 +107,13 @@ async def test_reusing_a_client_id_for_a_different_operation_conflicts(
         clash = await client.post(
             f"/v1/tenants/{tenant}/projects",
             headers={**auth("alice"), "Idempotency-Key": key},
-            json={"id": pid, "name": name},
+            json={"client_id": pid, "name": name},
         )
         assert clash.status_code == 409, label
         assert clash.json()["error"]["code"] == "conflict", label
 
-    page = await client.get(f"/v1/tenants/{tenant}/projects/{pid}", headers=auth("alice"))
+    canonical = original.json()["id"]
+    page = await client.get(f"/v1/tenants/{tenant}/projects/{canonical}", headers=auth("alice"))
     assert page.json()["project"]["name"] == "Kitchen rewire", "first creation wins"
 
 
@@ -122,10 +124,10 @@ async def test_a_later_rename_is_a_separate_operation_not_a_create_conflict(clie
     created = await client.post(
         f"/v1/tenants/{tenant}/projects",
         headers={**auth("alice"), "Idempotency-Key": "op-a"},
-        json={"id": pid, "name": "Kitchen rewire"},
+        json={"client_id": pid, "name": "Kitchen rewire"},
     )
     renamed = await client.patch(
-        f"/v1/tenants/{tenant}/projects/{pid}",
+        f"/v1/tenants/{tenant}/projects/{created.json()['id']}",
         headers={**auth("alice"), "If-Match": str(created.json()["row_version"])},
         json={"name": "Kitchen rewire v2"},
     )
@@ -139,25 +141,29 @@ async def test_a_client_id_confers_no_ownership(client, auth):
     bob_tenant = await _tenant(client, auth, "bob")
     pid = str(uuid.uuid4())
 
-    await client.post(
+    alice = await client.post(
         f"/v1/tenants/{alice_tenant}/projects",
         headers={**auth("alice"), "Idempotency-Key": "op-a"},
-        json={"id": pid, "name": "Alice's"},
+        json={"client_id": pid, "name": "Alice's"},
     )
-    # Bob naming the same id in his own tenant must not reach Alice's row.
-    bobs = await client.post(
+    # The SAME client_id in Bob's tenant must succeed as an independent resource —
+    # not conflict, not replay, and not reveal that Alice used the value.
+    bob = await client.post(
         f"/v1/tenants/{bob_tenant}/projects",
         headers={**auth("bob"), "Idempotency-Key": "op-a"},
-        json={"id": pid, "name": "Bob's"},
+        json={"client_id": pid, "name": "Bob's"},
     )
-    assert bobs.status_code in (201, 409)
-    assert (
-        await client.get(f"/v1/tenants/{bob_tenant}/projects/{pid}", headers=auth("bob"))
-    ).status_code in (200, 404)
-    alices = await client.get(
-        f"/v1/tenants/{alice_tenant}/projects/{pid}", headers=auth("alice")
-    )
-    assert alices.json()["project"]["name"] == "Alice's", "another tenant cannot overwrite it"
+    assert alice.status_code == 201 and bob.status_code == 201, "no oracle: both create"
+    assert alice.json()["id"] != bob.json()["id"], "distinct canonical ids"
+    assert alice.json()["client_id"] == bob.json()["client_id"] == pid
+
+    for tenant, who, expected in [(alice_tenant, "alice", "Alice's"), (bob_tenant, "bob", "Bob's")]:
+        page = await client.get(
+            f"/v1/tenants/{tenant}/projects/"
+            f"{(alice if who == 'alice' else bob).json()['id']}",
+            headers=auth(who),
+        )
+        assert page.json()["project"]["name"] == expected
 
 
 async def test_park_append_replays_by_identity_after_expiry(client, auth, db: Database):
@@ -167,12 +173,12 @@ async def test_park_append_replays_by_identity_after_expiry(client, auth, db: Da
         f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
     )).json()["id"]
     rid, key = str(uuid.uuid4()), "park-op"
-    body = {**PARK, "id": rid}
+    body = {**PARK, "client_id": rid}
     headers = {**auth("alice"), "Idempotency-Key": key}
     path = f"/v1/tenants/{tenant}/projects/{project}/parking"
 
     first = await client.post(path, headers=headers, json=body)
-    assert first.status_code == 201 and first.json()["id"] == rid
+    assert first.status_code == 201 and first.json()["client_id"] == rid
     await _expire_results(db, tenant, actor)
 
     replay = await client.post(path, headers=headers, json=body)
@@ -339,17 +345,19 @@ async def test_the_offline_sequence_converges_once_each(client, auth, db: Databa
     pid, rid = str(uuid.uuid4()), str(uuid.uuid4())
     authored = datetime(2026, 9, 8, 9, 0, tzinfo=timezone.utc).isoformat()
 
-    create = {"id": pid, "name": "Kitchen rewire"}
+    create = {"client_id": pid, "name": "Kitchen rewire"}
     ck = {**auth("alice"), "Idempotency-Key": "create-op"}
+    first = await client.post(f"/v1/tenants/{tenant}/projects", headers=ck, json=create)
+    assert first.status_code == 201
     assert (await client.post(f"/v1/tenants/{tenant}/projects", headers=ck, json=create)).status_code == 201
-    assert (await client.post(f"/v1/tenants/{tenant}/projects", headers=ck, json=create)).status_code == 201
+    canonical = first.json()["id"]
 
     # The client reads the canonical page for the notes version. It never assumes.
-    page = await client.get(f"/v1/tenants/{tenant}/projects/{pid}", headers=auth("alice"))
+    page = await client.get(f"/v1/tenants/{tenant}/projects/{canonical}", headers=auth("alice"))
     notes_version = page.json()["notes"]["row_version"]
 
     saved = await client.put(
-        f"/v1/tenants/{tenant}/projects/{pid}/notes",
+        f"/v1/tenants/{tenant}/projects/{canonical}/notes",
         headers={**auth("alice"), "If-Match": str(notes_version)},
         json={"body": "wire colours"},
     )
@@ -357,9 +365,9 @@ async def test_the_offline_sequence_converges_once_each(client, auth, db: Databa
 
     await _expire_results(db, tenant, actor)
 
-    park = {**PARK, "id": rid, "occurred_at": authored}
+    park = {**PARK, "client_id": rid, "occurred_at": authored}
     pk = {**auth("alice"), "Idempotency-Key": "park-op"}
-    path = f"/v1/tenants/{tenant}/projects/{pid}/parking"
+    path = f"/v1/tenants/{tenant}/projects/{canonical}/parking"
     assert (await client.post(path, headers=pk, json=park)).status_code == 201
     # Still inside the window this park just opened, so it replays the stored result.
     assert (await client.post(path, headers=pk, json=park)).status_code == 201
@@ -370,8 +378,83 @@ async def test_the_offline_sequence_converges_once_each(client, auth, db: Databa
     assert (await client.post(f"/v1/tenants/{tenant}/projects", headers=ck, json=create)).status_code == 200
 
     projects = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
-    assert [p["id"] for p in projects.json()] == [pid]
+    assert [p["client_id"] for p in projects.json()] == [pid]
     assert len((await client.get(path, headers=auth("alice"))).json()) == 1
-    final = await client.get(f"/v1/tenants/{tenant}/projects/{pid}", headers=auth("alice"))
+    final = await client.get(f"/v1/tenants/{tenant}/projects/{canonical}", headers=auth("alice"))
     assert final.json()["notes"]["body"] == "wire colours"
     assert final.json()["newest_parking"]["occurred_at"].startswith("2026-09-08T09:00")
+
+
+async def test_the_same_client_id_in_two_tenants_discloses_nothing(client, auth):
+    """The oracle this design exists to remove.
+
+    An earlier draft let the client supply the canonical id. Because that column
+    is globally unique, a value another tenant already held failed the insert
+    while an unused one succeeded — and the *status code* disclosed which, which no
+    wording of the message could fix. Tenant-scoped identity removes the question:
+    both tenants create successfully and neither observes the other.
+    """
+    alice_tenant = await _tenant(client, auth, "alice")
+    bob_tenant = await _tenant(client, auth, "bob")
+    shared = str(uuid.uuid4())
+
+    responses = []
+    for tenant, who in [(alice_tenant, "alice"), (bob_tenant, "bob")]:
+        responses.append(await client.post(
+            f"/v1/tenants/{tenant}/projects",
+            headers={**auth(who), "Idempotency-Key": "same-key"},
+            json={"client_id": shared, "name": f"{who}'s project"},
+        ))
+    assert [r.status_code for r in responses] == [201, 201]
+    assert responses[0].json()["id"] != responses[1].json()["id"]
+
+    # A control: a client_id nobody has used behaves identically to one another
+    # tenant is using. Indistinguishable responses mean there is nothing to probe.
+    control = await client.post(
+        f"/v1/tenants/{bob_tenant}/projects",
+        headers={**auth("bob"), "Idempotency-Key": "control"},
+        json={"client_id": str(uuid.uuid4()), "name": "control"},
+    )
+    assert control.status_code == responses[1].status_code
+
+
+async def test_park_client_ids_are_also_tenant_scoped(client, auth):
+    alice_tenant = await _tenant(client, auth, "alice")
+    bob_tenant = await _tenant(client, auth, "bob")
+    shared = str(uuid.uuid4())
+    codes = []
+    for tenant, who in [(alice_tenant, "alice"), (bob_tenant, "bob")]:
+        project = (await client.post(
+            f"/v1/tenants/{tenant}/projects", headers=auth(who), json={"name": "P"}
+        )).json()["id"]
+        r = await client.post(
+            f"/v1/tenants/{tenant}/projects/{project}/parking",
+            headers=auth(who), json={**PARK, "client_id": shared},
+        )
+        codes.append(r.status_code)
+    assert codes == [201, 201]
+
+
+async def test_a_create_without_a_client_id_stores_no_creation_identity(client, auth, db: Database):
+    """0.3 behaviour is unchanged, and the schema constraint stays satisfiable.
+
+    A fingerprint without a client identity is a row that can never replay and
+    never conflict — a state with no behaviour, which 0010 makes unreachable.
+    """
+    tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    created = await client.post(
+        f"/v1/tenants/{tenant}/projects",
+        headers={**auth("alice"), "Idempotency-Key": "no-client-id"},
+        json={"name": "server-assigned"},
+    )
+    assert created.status_code == 201
+    assert created.json()["client_id"] is None
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select client_id, creation_fingerprint from blocks.projects where id = %s",
+            (created.json()["id"],),
+        )
+        row = await cur.fetchone()
+    assert row["client_id"] is None and row["creation_fingerprint"] is None

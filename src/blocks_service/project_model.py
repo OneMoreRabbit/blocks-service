@@ -37,7 +37,7 @@ class ResourceIdentityConflict(ConcurrencyConflict):
     """
 
 PROJECT_COLUMNS = (
-    "id, tenant_id, name, status::text as status, row_version,"
+    "id, tenant_id, client_id, name, status::text as status, row_version,"
     " created_at, updated_at, archived_at"
 )
 
@@ -67,7 +67,7 @@ async def create_project(
     tenant_id: UUID,
     name: str,
     *,
-    project_id: UUID | None = None,
+    client_id: UUID | None = None,
     fingerprint: bytes | None = None,
 ) -> tuple[dict, bool]:
     """Create a project. Returns (project, replayed).
@@ -77,50 +77,63 @@ async def create_project(
     function remembers to do, so the guarantee holds for writers this code knows
     nothing about.
 
-    **Client-supplied id (ADR-0011).** A local-first client mints the id itself, so
-    the same create replayed after an unbounded offline period cannot duplicate --
-    identity, not memory, is what prevents it. The retained `creation_fingerprint`
-    is what separates the two cases that look identical from the outside:
+    **Client identity is TENANT-SCOPED (ADR-0011 v1.2).** The client names the row
+    with `client_id`; the canonical `id` stays server-generated. That is what makes
+    the same create replayable after an unbounded offline period *without* becoming
+    an oracle: every uniqueness check below runs under this tenant's policy, so a
+    `client_id` another tenant happens to use is not merely hidden — it is never
+    consulted, and there is nothing to probe.
 
-      same id, same operation      -> replay; return what exists
-      same id, different operation -> conflict; the id is taken
+    An earlier draft let the client supply the canonical id directly. Because `id`
+    is globally unique, a value another tenant already held failed the insert while
+    an unused one succeeded, and the *status code* disclosed which — a distinction
+    no wording of the message could remove.
+
+    The retained `creation_fingerprint` separates the two cases that otherwise look
+    identical from inside the tenant:
+
+      same client_id, same operation      -> replay; return what exists
+      same client_id, different operation -> conflict
 
     Ownership is never taken from the body. The tenant comes from the authenticated
-    route and the transaction context, exactly as before; a client chooses only the
-    id, never who owns the row.
+    route and the transaction context; a client chooses only its own name for a row.
     """
-    if project_id is not None:
+    # A fingerprint without a client identity is a row that can never replay and
+    # can never conflict. The check constraint in 0010 refuses that state; this is
+    # where it would otherwise be created, because the request dependency computes
+    # an identity for every request whether or not the client named the resource.
+    if client_id is None:
+        fingerprint = None
+
+    if client_id is not None:
         cur = await conn.execute(
             f"select {PROJECT_COLUMNS}, creation_fingerprint from blocks.projects"
-            " where id = %s",
-            (project_id,),
+            " where client_id = %s",
+            (client_id,),
         )
         existing = await cur.fetchone()
         if existing is not None:
             stored = existing.pop("creation_fingerprint")
             if stored is None or bytes(stored) != (fingerprint or b""):
                 raise ResourceIdentityConflict(
-                    "that project id already exists and was created by a different "
-                    "operation; mint a new id or reconcile against the existing project"
+                    "that client_id is already used in this tenant by a different "
+                    "operation; reconcile against the existing project"
                 )
             return existing, True
 
     try:
         cur = await conn.execute(
-            "insert into blocks.projects (tenant_id, id, name, creation_fingerprint)"
-            " values (%s, coalesce(%s, gen_random_uuid()), %s, %s)"
+            "insert into blocks.projects (tenant_id, client_id, name, creation_fingerprint)"
+            " values (%s, %s, %s, %s)"
             f" returning {PROJECT_COLUMNS}",
-            (tenant_id, project_id, name, fingerprint),
+            (tenant_id, client_id, name, fingerprint),
         )
     except psycopg.errors.UniqueViolation as exc:
-        # The id is unique across the whole table, so a client-chosen uuid can
-        # collide with a row in ANOTHER tenant -- which the lookup above cannot
-        # see, because it runs under this tenant's policy. Two things matter here:
-        # the caller genuinely must mint a new id, and the answer must not reveal
-        # whose id it collided with. A conflict says the first without the second;
-        # letting the constraint error escape would say both.
+        # Only reachable as a race: two concurrent creates with the same client_id
+        # in the SAME tenant, both past the lookup above. Tenant-scoped, so it
+        # discloses nothing outside the tenant.
         raise ResourceIdentityConflict(
-            "that resource id is not available; mint a new one"
+            "that client_id is already used in this tenant"
         ) from exc
     row = await cur.fetchone()
     assert row is not None
@@ -254,7 +267,7 @@ async def save_notes(
 # ---------------------------------------------------------------------------
 
 PARKING_COLUMNS = (
-    "id, project_id, where_i_am, next_physical_action, must_not_forget,"
+    "id, client_id, project_id, where_i_am, next_physical_action, must_not_forget,"
     " authored_by_user_id, device_id, supersedes_id, occurred_at, created_at"
 )
 
@@ -279,7 +292,7 @@ async def append_parking(
     must_not_forget: str,
     device_id: UUID | None = None,
     supersedes_id: UUID | None = None,
-    record_id: UUID | None = None,
+    client_id: UUID | None = None,
     occurred_at: datetime | None = None,
     fingerprint: bytes | None = None,
 ) -> tuple[dict, bool]:
@@ -295,19 +308,29 @@ async def append_parking(
     """
     await get_project(conn, project_id)  # 404 rather than a foreign-key error
 
-    if record_id is not None:
+    # A fingerprint without a client identity is a row that can never replay and
+    # can never conflict. The check constraint in 0010 refuses that state; this is
+    # where it would otherwise be created, because the request dependency computes
+    # an identity for every request whether or not the client named the resource.
+    if client_id is None:
+        fingerprint = None
+
+    if client_id is not None:
+        # Tenant-scoped, exactly as project create: the lookup runs under this
+        # tenant's policy, so another tenant's identical client_id is never
+        # consulted and cannot be probed for.
         cur = await conn.execute(
             f"select {PARKING_COLUMNS}, creation_fingerprint from blocks.parking_records"
-            " where id = %s",
-            (record_id,),
+            " where client_id = %s",
+            (client_id,),
         )
         existing = await cur.fetchone()
         if existing is not None:
             stored = existing.pop("creation_fingerprint")
             if stored is None or bytes(stored) != (fingerprint or b""):
                 raise ResourceIdentityConflict(
-                    "that parking record id already exists and was created by a "
-                    "different operation; mint a new id"
+                    "that client_id is already used in this tenant by a different "
+                    "operation"
                 )
             return existing, True
     if supersedes_id is not None:
@@ -328,21 +351,21 @@ async def append_parking(
     try:
         cur = await conn.execute(
             "insert into blocks.parking_records"
-            " (tenant_id, project_id, id, where_i_am, next_physical_action, must_not_forget,"
-            "  authored_by_user_id, device_id, sequence, supersedes_id, occurred_at,"
-            "  creation_fingerprint)"
-            " values (%s, %s, coalesce(%s, gen_random_uuid()), %s, %s, %s, %s, %s, %s, %s,"
+            " (tenant_id, project_id, client_id, where_i_am, next_physical_action,"
+            "  must_not_forget, authored_by_user_id, device_id, sequence, supersedes_id,"
+            "  occurred_at, creation_fingerprint)"
+            " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
             "         coalesce(%s, now()), %s)"
             f" returning {PARKING_COLUMNS}",
             (
-                tenant_id, project_id, record_id, where_i_am, next_physical_action,
+                tenant_id, project_id, client_id, where_i_am, next_physical_action,
                 must_not_forget, actor_id, device_id, sequence, supersedes_id,
                 occurred_at, fingerprint,
             ),
         )
     except psycopg.errors.UniqueViolation as exc:
         raise ResourceIdentityConflict(
-            "that resource id is not available; mint a new one"
+            "that client_id is already used in this tenant"
         ) from exc
     row = await cur.fetchone()
     assert row is not None

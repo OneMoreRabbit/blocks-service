@@ -19,10 +19,11 @@ from psycopg.rows import dict_row
 
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
-EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008", "0009"))]
+EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008", "0009", "0010"))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
+SCOPED = EXPAND[3]        # 0010 — tenant-scoped client identity
 SCRATCH = "blocks_migration_drill"
 
 
@@ -120,7 +121,7 @@ def _apply(dbname: str, migration: pathlib.Path) -> None:
 
 
 def _migrate(dbname: str) -> None:
-    """The whole expand step, as it deploys: 0007, 0008, then 0009."""
+    """The whole expand step, as it deploys: 0007 through 0010."""
     for migration in EXPAND:
         _apply(dbname, migration)
 
@@ -468,7 +469,8 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
     assert orphan == 0, "precondition: the legacy writer creates no notes row"
 
     _apply(legacy_db, INVARIANT)                    # 0008 heals it
-    _apply(legacy_db, IDENTITY)                     # 0009 completes the expand step
+    _apply(legacy_db, IDENTITY)                     # 0009
+    _apply(legacy_db, SCOPED)                       # 0010 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,

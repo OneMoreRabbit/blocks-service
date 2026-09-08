@@ -19,6 +19,37 @@ from .. import errors, project_model as pm
 from ..idempotency import Idempotency
 from .deps import TenantContext, as_http, idempotency, if_match_version, tenant_context
 
+#: The `200` a resource replay returns, declared so a generated client never has
+#: to infer it. The distinction from `201` is real: `201` carries the ORIGINAL
+#: STORED BYTES of the first response, while `200` carries the resource's CURRENT
+#: state, which may have been renamed or superseded since it was created.
+def _replay_responses(model: str) -> dict:
+    return {
+        200: {
+            "description": (
+                "Resource replay. The ordinary idempotency result had expired, so "
+                "the request was recognised by tenant-scoped client identity "
+                "instead. The body is the resource's CURRENT state, not the "
+                "original stored response, and nothing was created."
+            ),
+            "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{model}"}}},
+            "headers": {
+                "Idempotent-Replay": {
+                    "description": "`true`. Always present on any replay.",
+                    "schema": {"type": "string", "enum": ["true"]},
+                },
+                "Idempotent-Replay-Source": {
+                    "description": (
+                        "`resource` — recognised by client identity after the stored "
+                        "result expired. Absent on a retained-result replay, which "
+                        "returns 201 with the original bytes."
+                    ),
+                    "schema": {"type": "string", "enum": ["resource"]},
+                },
+            },
+        }
+    }
+
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects", tags=["projects-0.3"])
 
 
@@ -45,15 +76,15 @@ class _ResourceReplay(Exception):
 
 class ProjectIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    id: UUID | None = Field(
+    client_id: UUID | None = Field(
         default=None,
         description=(
-            "**Optional client-generated canonical id.** A local-first client mints "
-            "this at local commit and always supplies it, so a create replayed after "
-            "any offline period cannot duplicate — identity prevents it, not the "
-            "server's memory. Omit it to keep API 0.3 server-assigned behaviour. It "
-            "confers no ownership: the tenant comes from the route and the "
-            "authenticated context, never from this body."
+            "**Optional client identifier, unique within your tenant.** A local-first "
+            "client mints this at local commit and always supplies it, so a create "
+            "replayed after any offline period cannot duplicate. It is **not** the "
+            "canonical id: Service still generates that and returns both. Two tenants "
+            "may use the same value for unrelated projects, and neither can learn "
+            "anything about the other. Omit it to keep API 0.3 behaviour."
         ),
     )
     name: str = Field(min_length=1, max_length=200)
@@ -65,6 +96,9 @@ class ProjectRename(BaseModel):
 
 
 class ProjectOut(BaseModel):
+    client_id: UUID | None = Field(
+        default=None, description="Your identifier for this project, if you supplied one."
+    )
     """A superset of the 0.2 project shape, deliberately.
 
     0.2 published `{id, tenant_id, name}` on the same path. Serving a *narrower*
@@ -104,8 +138,9 @@ class ProjectParkIn(BaseModel):
     """The three answers, all required. A correction supersedes rather than edits."""
 
     model_config = ConfigDict(extra="forbid")
-    id: UUID | None = Field(
-        default=None, description="Optional client-generated canonical record id."
+    client_id: UUID | None = Field(
+        default=None,
+        description="Optional client identifier, unique within your tenant. Not the canonical id.",
     )
     occurred_at: datetime | None = Field(
         default=None,
@@ -127,6 +162,9 @@ class ProjectParkIn(BaseModel):
 
 
 class ProjectParkingOut(BaseModel):
+    client_id: UUID | None = Field(
+        default=None, description="Your identifier for this record, if you supplied one."
+    )
     occurred_at: datetime = Field(
         description="When the user committed it. Always present from 0.4."
     )
@@ -181,8 +219,18 @@ async def list_projects(
     "",
     status_code=status.HTTP_201_CREATED,
     response_model=ProjectOut,
-    responses=errors.error_responses(400, 401, 403, 409, 426),
+    responses={
+        **errors.error_responses(400, 401, 403, 409, 426),
+        **_replay_responses("ProjectOut"),
+    },
     summary="Create a project",
+    description=(
+        "`201` on first creation, and on a replay while the idempotency result is "
+        "retained — that response carries the **original stored bytes**. `200` on a "
+        "resource replay after the result expired, carrying the resource's "
+        "**current state**. `409` if the same `client_id` names a different "
+        "operation in this tenant."
+    ),
 )
 async def create_project(
     body: ProjectIn,
@@ -193,7 +241,7 @@ async def create_project(
         try:
             row, replayed = await pm.create_project(
                 ctx.conn, ctx.tenant_id, body.name,
-                project_id=body.id, fingerprint=idem.creation_identity,
+                client_id=body.client_id, fingerprint=idem.creation_identity,
             )
         except pm.DomainError as exc:
             raise as_http(exc) from exc
@@ -348,8 +396,16 @@ async def save_notes(
     "/{project_id}/parking",
     status_code=status.HTTP_201_CREATED,
     response_model=ProjectParkingOut,
-    responses=errors.error_responses(400, 401, 403, 404, 409, 426),
+    responses={
+        **errors.error_responses(400, 401, 403, 404, 409, 426),
+        **_replay_responses("ProjectParkingOut"),
+    },
     summary="Add a park message",
+    description=(
+        "`201` on first append and on a retained-result replay (original bytes). "
+        "`200` on a resource replay after expiry (current state). `409` if the same "
+        "`client_id` names a different operation in this tenant."
+    ),
 )
 async def add_parking(
     project_id: UUID,
@@ -367,7 +423,7 @@ async def add_parking(
                 must_not_forget=body.must_not_forget,
                 device_id=body.device_id,
                 supersedes_id=body.supersedes_id,
-                record_id=body.id,
+                client_id=body.client_id,
                 occurred_at=body.occurred_at,
                 fingerprint=idem.creation_identity,
             )
