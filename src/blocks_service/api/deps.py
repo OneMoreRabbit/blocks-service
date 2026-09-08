@@ -12,7 +12,7 @@ from fastapi import Depends, Header, Path, Request
 from .. import errors, repository
 from ..db import Database
 from ..identity import IdentityVerifier, InvalidToken, Principal
-from ..idempotency import Idempotency, fingerprint
+from ..idempotency import Idempotency, creation_identity, fingerprint
 from ..operating_loop import (
     ActiveSessionExists,
     ConcurrencyConflict,
@@ -111,12 +111,19 @@ async def idempotency(
     appears in the generated description — a header a client must send is part of
     the machine contract, not a convention documented in prose.
     """
-    return Idempotency(
+    body = await request.body()
+    idem = Idempotency(
         ctx.conn,
         ctx.tenant_id,
         idempotency_key,
-        fingerprint(request.method, request.url.path, await request.body()),
+        fingerprint(request.method, request.url.path, body),
     )
+    # Carried alongside so a handler creating a resource can retain the identity
+    # that survives result expiry (ADR-0011). Same key + same initial body.
+    idem.creation_identity = creation_identity(
+        idempotency_key, request.method, request.url.path, body
+    )
+    return idem
 
 
 def if_match_version(

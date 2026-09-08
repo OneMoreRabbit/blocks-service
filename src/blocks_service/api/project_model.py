@@ -22,8 +22,40 @@ from .deps import TenantContext, as_http, idempotency, if_match_version, tenant_
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects", tags=["projects-0.3"])
 
 
+class _ResourceReplay(Exception):
+    """A create/append recognised by RESOURCE identity rather than a stored result.
+
+    Distinguished from an ordinary idempotent replay in the response, because the
+    two carry different guarantees. A retained-result replay returns the original
+    bytes; this one can only return the resource's CURRENT state, which may have
+    been renamed or superseded since. `200` rather than `201` says so — nothing was
+    created by this request — and the header marks it as a replay either way.
+    """
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    def response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=self._body,
+            headers={"Idempotent-Replay": "true", "Idempotent-Replay-Source": "resource"},
+        )
+
+
 class ProjectIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    id: UUID | None = Field(
+        default=None,
+        description=(
+            "**Optional client-generated canonical id.** A local-first client mints "
+            "this at local commit and always supplies it, so a create replayed after "
+            "any offline period cannot duplicate — identity prevents it, not the "
+            "server's memory. Omit it to keep API 0.3 server-assigned behaviour. It "
+            "confers no ownership: the tenant comes from the route and the "
+            "authenticated context, never from this body."
+        ),
+    )
     name: str = Field(min_length=1, max_length=200)
 
 
@@ -72,6 +104,19 @@ class ProjectParkIn(BaseModel):
     """The three answers, all required. A correction supersedes rather than edits."""
 
     model_config = ConfigDict(extra="forbid")
+    id: UUID | None = Field(
+        default=None, description="Optional client-generated canonical record id."
+    )
+    occurred_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the user committed this park locally, normalized UTC. Supplied by "
+            "a local-first client; omitted by older clients, which get the server's "
+            "acceptance time. Recorded as given and never silently rewritten — "
+            "ordering by it is what stops delayed delivery reordering the user's "
+            "own history."
+        ),
+    )
     where_i_am: str = Field(min_length=1, max_length=2000)
     next_physical_action: str = Field(min_length=1, max_length=2000)
     must_not_forget: str = Field(min_length=1, max_length=2000)
@@ -82,6 +127,9 @@ class ProjectParkIn(BaseModel):
 
 
 class ProjectParkingOut(BaseModel):
+    occurred_at: datetime = Field(
+        description="When the user committed it. Always present from 0.4."
+    )
     """Named apart from 0.2's `ParkingOut` on purpose.
 
     A model-name collision makes the generator mangle BOTH into
@@ -142,10 +190,21 @@ async def create_project(
     idem: Idempotency = Depends(idempotency),
 ) -> JSONResponse:
     async def produce() -> dict:
-        row = await pm.create_project(ctx.conn, ctx.tenant_id, body.name)
+        try:
+            row, replayed = await pm.create_project(
+                ctx.conn, ctx.tenant_id, body.name,
+                project_id=body.id, fingerprint=idem.creation_identity,
+            )
+        except pm.DomainError as exc:
+            raise as_http(exc) from exc
+        if replayed:
+            raise _ResourceReplay(ProjectOut(**row).model_dump(mode="json"))
         return ProjectOut(**row).model_dump(mode="json")
 
-    return await idem.run(status.HTTP_201_CREATED, produce)
+    try:
+        return await idem.run(status.HTTP_201_CREATED, produce)
+    except _ResourceReplay as replay:
+        return replay.response()
 
 
 @router.get(
@@ -300,7 +359,7 @@ async def add_parking(
 ) -> JSONResponse:
     async def produce() -> dict:
         try:
-            row = await pm.append_parking(
+            row, replayed = await pm.append_parking(
                 ctx.conn, ctx.tenant_id, project_id,
                 actor_id=ctx.actor_id,
                 where_i_am=body.where_i_am,
@@ -308,12 +367,20 @@ async def add_parking(
                 must_not_forget=body.must_not_forget,
                 device_id=body.device_id,
                 supersedes_id=body.supersedes_id,
+                record_id=body.id,
+                occurred_at=body.occurred_at,
+                fingerprint=idem.creation_identity,
             )
-        except Exception as exc:
+        except pm.DomainError as exc:
             raise as_http(exc) from exc
+        if replayed:
+            raise _ResourceReplay(ProjectParkingOut(**row).model_dump(mode="json"))
         return ProjectParkingOut(**row).model_dump(mode="json")
 
-    return await idem.run(status.HTTP_201_CREATED, produce)
+    try:
+        return await idem.run(status.HTTP_201_CREATED, produce)
+    except _ResourceReplay as replay:
+        return replay.response()
 
 
 @router.get(

@@ -14,12 +14,27 @@ tenant predicate; see `db.py` for why that is the design rather than an omission
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 import psycopg
 
 from . import events
-from .operating_loop import ConcurrencyConflict, IllegalTransition, NotFound
+from .operating_loop import (
+    ConcurrencyConflict,
+    DomainError,
+    IllegalTransition,
+    NotFound,
+)
+
+
+class ResourceIdentityConflict(ConcurrencyConflict):
+    """A client-supplied resource id already names a different operation.
+
+    Distinct from a stale version, though both surface as 409: this one can never
+    be resolved by re-reading and retrying, because the id itself is taken. A
+    client must mint a new id or reconcile against the resource that exists.
+    """
 
 PROJECT_COLUMNS = (
     "id, tenant_id, name, status::text as status, row_version,"
@@ -47,20 +62,66 @@ async def get_project(conn: psycopg.AsyncConnection, project_id: UUID) -> dict:
     return row
 
 
-async def create_project(conn: psycopg.AsyncConnection, tenant_id: UUID, name: str) -> dict:
-    """Create a project. Its empty notes document arrives with it.
+async def create_project(
+    conn: psycopg.AsyncConnection,
+    tenant_id: UUID,
+    name: str,
+    *,
+    project_id: UUID | None = None,
+    fingerprint: bytes | None = None,
+) -> tuple[dict, bool]:
+    """Create a project. Returns (project, replayed).
 
-    The notes row is a database invariant (`projects_ensure_notes`, migration
-    0008) rather than something this function remembers to do. That is deliberate:
-    during the window between migration and image cutover the pre-0.3 writer is
-    still live and inserts projects without notes, so the guarantee has to hold
-    for writers this code knows nothing about.
+    Its empty notes document arrives with it: the notes row is a database
+    invariant (`projects_ensure_notes`, migration 0008) rather than something this
+    function remembers to do, so the guarantee holds for writers this code knows
+    nothing about.
+
+    **Client-supplied id (ADR-0011).** A local-first client mints the id itself, so
+    the same create replayed after an unbounded offline period cannot duplicate --
+    identity, not memory, is what prevents it. The retained `creation_fingerprint`
+    is what separates the two cases that look identical from the outside:
+
+      same id, same operation      -> replay; return what exists
+      same id, different operation -> conflict; the id is taken
+
+    Ownership is never taken from the body. The tenant comes from the authenticated
+    route and the transaction context, exactly as before; a client chooses only the
+    id, never who owns the row.
     """
-    cur = await conn.execute(
-        "insert into blocks.projects (tenant_id, name) values (%s, %s)"
-        f" returning {PROJECT_COLUMNS}",
-        (tenant_id, name),
-    )
+    if project_id is not None:
+        cur = await conn.execute(
+            f"select {PROJECT_COLUMNS}, creation_fingerprint from blocks.projects"
+            " where id = %s",
+            (project_id,),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            stored = existing.pop("creation_fingerprint")
+            if stored is None or bytes(stored) != (fingerprint or b""):
+                raise ResourceIdentityConflict(
+                    "that project id already exists and was created by a different "
+                    "operation; mint a new id or reconcile against the existing project"
+                )
+            return existing, True
+
+    try:
+        cur = await conn.execute(
+            "insert into blocks.projects (tenant_id, id, name, creation_fingerprint)"
+            " values (%s, coalesce(%s, gen_random_uuid()), %s, %s)"
+            f" returning {PROJECT_COLUMNS}",
+            (tenant_id, project_id, name, fingerprint),
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        # The id is unique across the whole table, so a client-chosen uuid can
+        # collide with a row in ANOTHER tenant -- which the lookup above cannot
+        # see, because it runs under this tenant's policy. Two things matter here:
+        # the caller genuinely must mint a new id, and the answer must not reveal
+        # whose id it collided with. A conflict says the first without the second;
+        # letting the constraint error escape would say both.
+        raise ResourceIdentityConflict(
+            "that resource id is not available; mint a new one"
+        ) from exc
     row = await cur.fetchone()
     assert row is not None
     # The notes row is created by the `projects_ensure_notes` trigger (0008), not
@@ -72,7 +133,7 @@ async def create_project(conn: psycopg.AsyncConnection, tenant_id: UUID, name: s
         event_type="project.created",
         payload={"projectId": str(row["id"])},
     )
-    return row
+    return row, False
 
 
 async def _update_project(
@@ -94,9 +155,11 @@ async def _update_project(
     )
     row = await cur.fetchone()
     if row is None:
-        raise ConcurrencyConflict(
-            "project was modified by someone else, or does not exist in this tenant"
-        )
+        # Absent and stale look identical to an UPDATE that matched nothing, and a
+        # local-first client mid-remap must tell them apart: a wrong identity must
+        # not be retried, a stale version must be. So ask which it is.
+        await get_project(conn, project_id)   # raises NotFound -> 404
+        raise ConcurrencyConflict("project was modified by someone else; re-read and retry")
     await events.emit(
         conn,
         tenant_id=tenant_id,
@@ -174,9 +237,8 @@ async def save_notes(
     )
     row = await cur.fetchone()
     if row is None:
-        raise ConcurrencyConflict(
-            "notes were modified by someone else, or the project does not exist here"
-        )
+        await get_project(conn, project_id)   # raises NotFound -> 404
+        raise ConcurrencyConflict("notes were modified by someone else; re-read and retry")
     # Identifiers and routing metadata only -- never the note body.
     await events.emit(
         conn,
@@ -193,8 +255,17 @@ async def save_notes(
 
 PARKING_COLUMNS = (
     "id, project_id, where_i_am, next_physical_action, must_not_forget,"
-    " authored_by_user_id, device_id, supersedes_id, created_at"
+    " authored_by_user_id, device_id, supersedes_id, occurred_at, created_at"
 )
+
+#: Newest-first, total and deterministic (ADR-0011).
+#:
+#: `occurred_at` first, so delivery delay cannot reorder the user's own history --
+#: a park written at 09:00 and delivered at 17:00 belongs at 09:00. `created_at`
+#: breaks a tie between two rows authored in the same instant, and `id` makes the
+#: order total rather than merely usually-stable: without it, two rows sharing both
+#: timestamps would order differently between queries, and "newest" would flicker.
+AUTHORED_ORDER = "occurred_at desc, created_at desc, id desc"
 
 
 async def append_parking(
@@ -208,13 +279,37 @@ async def append_parking(
     must_not_forget: str,
     device_id: UUID | None = None,
     supersedes_id: UUID | None = None,
-) -> dict:
-    """Append a park message. Optional, immutable, newest-first.
+    record_id: UUID | None = None,
+    occurred_at: datetime | None = None,
+    fingerprint: bytes | None = None,
+) -> tuple[dict, bool]:
+    """Append a park message. Returns (record, replayed).
 
-    Corrections append a superseding record rather than editing one; the table
-    grants `blocks_app` no UPDATE at all, so that is enforced rather than agreed.
+    Optional, immutable, newest-first. Corrections append a superseding record
+    rather than editing one; the table grants `blocks_app` no UPDATE at all, so
+    that is enforced rather than agreed.
+
+    Client-supplied id and `occurred_at` behave as on project create: identity
+    prevents a duplicate after any offline period, and the authored instant is
+    recorded as given rather than as delivered.
     """
     await get_project(conn, project_id)  # 404 rather than a foreign-key error
+
+    if record_id is not None:
+        cur = await conn.execute(
+            f"select {PARKING_COLUMNS}, creation_fingerprint from blocks.parking_records"
+            " where id = %s",
+            (record_id,),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            stored = existing.pop("creation_fingerprint")
+            if stored is None or bytes(stored) != (fingerprint or b""):
+                raise ResourceIdentityConflict(
+                    "that parking record id already exists and was created by a "
+                    "different operation; mint a new id"
+                )
+            return existing, True
     if supersedes_id is not None:
         cur = await conn.execute(
             "select 1 from blocks.parking_records where id = %s and project_id = %s",
@@ -230,17 +325,25 @@ async def append_parking(
     )
     sequence = (await cur.fetchone())["n"]
 
-    cur = await conn.execute(
-        "insert into blocks.parking_records"
-        " (tenant_id, project_id, where_i_am, next_physical_action, must_not_forget,"
-        "  authored_by_user_id, device_id, sequence, supersedes_id)"
-        " values (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
-        f" returning {PARKING_COLUMNS}",
-        (
-            tenant_id, project_id, where_i_am, next_physical_action, must_not_forget,
-            actor_id, device_id, sequence, supersedes_id,
-        ),
-    )
+    try:
+        cur = await conn.execute(
+            "insert into blocks.parking_records"
+            " (tenant_id, project_id, id, where_i_am, next_physical_action, must_not_forget,"
+            "  authored_by_user_id, device_id, sequence, supersedes_id, occurred_at,"
+            "  creation_fingerprint)"
+            " values (%s, %s, coalesce(%s, gen_random_uuid()), %s, %s, %s, %s, %s, %s, %s,"
+            "         coalesce(%s, now()), %s)"
+            f" returning {PARKING_COLUMNS}",
+            (
+                tenant_id, project_id, record_id, where_i_am, next_physical_action,
+                must_not_forget, actor_id, device_id, sequence, supersedes_id,
+                occurred_at, fingerprint,
+            ),
+        )
+    except psycopg.errors.UniqueViolation as exc:
+        raise ResourceIdentityConflict(
+            "that resource id is not available; mint a new one"
+        ) from exc
     row = await cur.fetchone()
     assert row is not None
     await events.emit(
@@ -249,7 +352,7 @@ async def append_parking(
         event_type="project.parked",
         payload={"projectId": str(project_id), "parkingRecordId": str(row["id"])},
     )
-    return row
+    return row, False
 
 
 async def newest_parking(conn: psycopg.AsyncConnection, project_id: UUID) -> dict | None:
@@ -260,7 +363,7 @@ async def newest_parking(conn: psycopg.AsyncConnection, project_id: UUID) -> dic
         "   and not exists ("
         "     select 1 from blocks.parking_records s where s.supersedes_id = p.id"
         "   )"
-        " order by p.created_at desc, p.id desc limit 1",
+        " order by p.{order} limit 1".replace("{order}", AUTHORED_ORDER),
         (project_id,),
     )
     return await cur.fetchone()
@@ -275,7 +378,7 @@ async def parking_history(conn: psycopg.AsyncConnection, project_id: UUID) -> li
     """
     cur = await conn.execute(
         f"select {PARKING_COLUMNS} from blocks.parking_records"
-        " where project_id = %s order by created_at desc, id desc",
+        f" where project_id = %s order by {AUTHORED_ORDER}",
         (project_id,),
     )
     return list(await cur.fetchall())

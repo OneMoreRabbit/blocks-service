@@ -23,6 +23,28 @@ from fastapi.responses import JSONResponse
 from . import errors
 
 
+def creation_identity(key: str | None, method: str, path: str, body: bytes) -> bytes:
+    """The identity retained on a resource for the life of the resource.
+
+    Covers the **key and the initial body** together (the resource id is the row it
+    is stored on), so the fixed precedence rule reduces to one comparison:
+
+        same id + same key + same initial body  -> resource replay
+        any mismatch                            -> 409
+
+    Deliberately a separate value from the `fingerprint()` stored in
+    `idempotency_keys`. That one answers "what did this operation return" and may
+    expire; this one answers "is this the same operation that created this
+    resource" and must not. Folding the key in is what makes "the same key with a
+    different id or body is always 409" true after expiry as well as before.
+    """
+    digest = hashlib.sha256()
+    digest.update((key or "").encode())
+    digest.update(b"\0")
+    digest.update(fingerprint(method, path, body))
+    return digest.digest()
+
+
 def fingerprint(method: str, path: str, body: bytes) -> bytes:
     digest = hashlib.sha256()
     digest.update(method.encode())
@@ -52,6 +74,9 @@ class Idempotency:
         self._tenant_id = tenant_id
         self._key = key
         self._fingerprint = request_fingerprint
+        #: Set by the request dependency; retained on a resource so identity
+        #: survives this record's expiry (ADR-0011).
+        self.creation_identity: bytes | None = None
 
     async def run(
         self, status_code: int, produce: Callable[[], Awaitable[dict]]
