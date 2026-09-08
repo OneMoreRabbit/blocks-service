@@ -458,3 +458,124 @@ async def test_a_create_without_a_client_id_stores_no_creation_identity(client, 
         )
         row = await cur.fetchone()
     assert row["client_id"] is None and row["creation_fingerprint"] is None
+
+
+# --------------------------------------------------------------------------
+# Real concurrency: simultaneous delivery of the same queued operation
+# --------------------------------------------------------------------------
+#
+# A retry that races its own original must converge, not conflict. Sequential
+# tests cannot see this: both requests have to be in flight at once, each on its
+# own pooled connection, for the lookup-then-insert window to open at all.
+
+
+async def _gather(client, path, headers_bodies):
+    import asyncio
+
+    return await asyncio.gather(
+        *(client.post(path, headers=h, json=b) for h, b in headers_bodies)
+    )
+
+
+async def test_identical_simultaneous_creates_converge_to_one_row(client, auth):
+    tenant = await _tenant(client, auth)
+    cid, key = str(uuid.uuid4()), "race-" + uuid.uuid4().hex[:6]
+    headers = {**auth("alice"), "Idempotency-Key": key}
+    body = {"client_id": cid, "name": "Kitchen rewire"}
+
+    responses = await _gather(
+        client, f"/v1/tenants/{tenant}/projects", [(headers, body), (headers, body)]
+    )
+
+    codes = sorted(r.status_code for r in responses)
+    assert 409 not in codes, "a retry racing itself must never conflict with itself"
+    assert codes in ([200, 201], [201, 201]), codes
+    assert {r.json()["id"] for r in responses} == {responses[0].json()["id"]}, "one identity"
+
+    listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+    assert len(listed.json()) == 1, "exactly one row"
+
+
+async def test_simultaneous_same_key_different_body_yields_one_winner(client, auth):
+    tenant = await _tenant(client, auth)
+    key = "race-" + uuid.uuid4().hex[:6]
+    headers = {**auth("alice"), "Idempotency-Key": key}
+
+    responses = await _gather(client, f"/v1/tenants/{tenant}/projects", [
+        (headers, {"client_id": str(uuid.uuid4()), "name": "one"}),
+        (headers, {"client_id": str(uuid.uuid4()), "name": "two"}),
+    ])
+    codes = sorted(r.status_code for r in responses)
+    assert codes == [201, 409], codes
+
+    listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+    assert len(listed.json()) == 1, "one winner, not two rows"
+
+
+async def test_simultaneous_same_client_id_different_keys_yields_one_winner(client, auth):
+    tenant = await _tenant(client, auth)
+    cid = str(uuid.uuid4())
+
+    responses = await _gather(client, f"/v1/tenants/{tenant}/projects", [
+        ({**auth("alice"), "Idempotency-Key": "key-a"}, {"client_id": cid, "name": "one"}),
+        ({**auth("alice"), "Idempotency-Key": "key-b"}, {"client_id": cid, "name": "two"}),
+    ])
+    codes = sorted(r.status_code for r in responses)
+    assert codes == [201, 409], codes
+
+    listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+    assert len(listed.json()) == 1
+
+
+async def test_identical_simultaneous_parks_converge_to_one_record(client, auth):
+    tenant = await _tenant(client, auth)
+    project = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
+    )).json()["id"]
+    path = f"/v1/tenants/{tenant}/projects/{project}/parking"
+    cid = str(uuid.uuid4())
+    headers = {**auth("alice"), "Idempotency-Key": "park-race"}
+    body = {**PARK, "client_id": cid}
+
+    responses = await _gather(client, path, [(headers, body), (headers, body)])
+    assert 409 not in [r.status_code for r in responses]
+    assert len((await client.get(path, headers=auth("alice"))).json()) == 1
+
+
+async def test_the_service_still_works_after_every_race(client, auth):
+    """No transaction left aborted and no partial idempotency state behind."""
+    tenant = await _tenant(client, auth)
+    key = "race-" + uuid.uuid4().hex[:6]
+    await _gather(client, f"/v1/tenants/{tenant}/projects", [
+        ({**auth("alice"), "Idempotency-Key": key}, {"client_id": str(uuid.uuid4()), "name": "a"}),
+        ({**auth("alice"), "Idempotency-Key": key}, {"client_id": str(uuid.uuid4()), "name": "b"}),
+    ])
+    after = await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "after"}
+    )
+    assert after.status_code == 201, "the service must be usable after a lost race"
+
+
+async def test_superseding_the_same_record_twice_is_not_a_client_id_error(client, auth):
+    """Two unique constraints, two different repairs. Do not confuse them."""
+    tenant = await _tenant(client, auth)
+    project = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
+    )).json()["id"]
+    path = f"/v1/tenants/{tenant}/projects/{project}/parking"
+
+    original = (await client.post(path, headers=auth("alice"), json=PARK)).json()
+    first = await client.post(
+        path, headers=auth("alice"),
+        json={**PARK, "where_i_am": "correction", "supersedes_id": original["id"]},
+    )
+    assert first.status_code == 201
+
+    second = await client.post(
+        path, headers=auth("alice"),
+        json={**PARK, "where_i_am": "second correction", "supersedes_id": original["id"]},
+    )
+    assert second.status_code == 409
+    message = second.json()["error"]["message"]
+    assert "superseded" in message, message
+    assert "client_id" not in message, "must not send the client to fix the wrong identity"

@@ -37,35 +37,26 @@ create unique index projects_tenant_client_id_key
 create unique index parking_records_tenant_client_id_key
   on blocks.parking_records (tenant_id, client_id) where client_id is not null;
 
--- A creation fingerprint only means something next to the client identity it was
--- computed for. One without the other is a row that can never replay and can
--- never conflict -- a state with no behaviour, which is worth making unreachable
--- rather than merely unlikely.
-alter table blocks.projects
-  add constraint projects_client_identity_complete check (
-    (client_id is null) = (creation_fingerprint is null)
-  );
-
-alter table blocks.parking_records
-  add constraint parking_client_identity_complete check (
-    (client_id is null) = (creation_fingerprint is null)
-  );
-
 -- ---------------------------------------------------------------------------
--- 0009-era backfill
+-- 0009-era backfill, BEFORE the constraints that describe its result
 -- ---------------------------------------------------------------------------
+--
+-- Order is the whole of the bug this section once had. The completeness
+-- constraints below were added and validated immediately, and only then was this
+-- backfill run -- so on a real database an eligible 0009-era row (fingerprint set,
+-- client_id still null) violated the constraint before the statement that would
+-- have satisfied it. The migration failed at exactly the boundary it exists to
+-- repair, and passed in test only because no test seeded such a row.
 --
 -- Rows created while 0009 was live took the client's value AS their canonical id
 -- and recorded a fingerprint. Those clients already hold that value and will
--- replay with it, so client_id = id preserves an identity that is already in use.
+-- replay with it, so client_id = id preserves an identity already in use.
 --
 -- Only those rows. A null fingerprint means the id was server-assigned and the
--- client never named it, so inventing a client_id would be inventing a fact --
--- and would also make the check constraint above a lie.
+-- client never named it, so inventing a client_id would be inventing a fact.
 --
 -- FORCE off for the sweep: a migration has no tenant context, so with it on this
--- updates nothing and reports success. Third time on this schema; the constraint
--- above is what would catch it now.
+-- updates nothing and reports success.
 alter table blocks.projects        no force row level security;
 alter table blocks.parking_records no force row level security;
 
@@ -79,3 +70,30 @@ update blocks.parking_records
 
 alter table blocks.parking_records force row level security;
 alter table blocks.projects        force row level security;
+
+-- ---------------------------------------------------------------------------
+-- Completeness, validated only now that the data satisfies it
+-- ---------------------------------------------------------------------------
+--
+-- A creation fingerprint only means something next to the client identity it was
+-- computed for. One without the other is a row that can never replay and can
+-- never conflict -- a state with no behaviour, worth making unreachable rather
+-- than merely unlikely.
+--
+-- Added NOT VALID and validated separately even though the backfill above has
+-- already satisfied it: NOT VALID takes a weaker lock, and validating as its own
+-- statement makes the ordering dependency explicit to anyone reading rather than
+-- implicit in the line order.
+
+alter table blocks.projects
+  add constraint projects_client_identity_complete check (
+    (client_id is null) = (creation_fingerprint is null)
+  ) not valid;
+
+alter table blocks.parking_records
+  add constraint parking_client_identity_complete check (
+    (client_id is null) = (creation_fingerprint is null)
+  ) not valid;
+
+alter table blocks.projects        validate constraint projects_client_identity_complete;
+alter table blocks.parking_records validate constraint parking_client_identity_complete;

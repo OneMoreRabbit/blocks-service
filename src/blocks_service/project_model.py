@@ -29,7 +29,7 @@ from .operating_loop import (
 
 
 class ResourceIdentityConflict(ConcurrencyConflict):
-    """A client-supplied resource id already names a different operation.
+    """A tenant-scoped client identity already names a different operation.
 
     Distinct from a stale version, though both surface as 409: this one can never
     be resolved by re-reading and retrying, because the id itself is taken. A
@@ -60,6 +60,45 @@ async def get_project(conn: psycopg.AsyncConnection, project_id: UUID) -> dict:
     if row is None:
         raise NotFound("no such project in this tenant")
     return row
+
+
+def _violated(exc: psycopg.errors.UniqueViolation) -> str:
+    """The constraint a unique violation actually names."""
+    return getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+
+
+async def _resolve_identity_race(
+    conn: psycopg.AsyncConnection,
+    columns: str,
+    table: str,
+    client_id: UUID | None,
+    fingerprint: bytes | None,
+    exc: psycopg.errors.UniqueViolation,
+) -> tuple[dict, bool]:
+    """Decide what losing a unique insert to a concurrent request means.
+
+    Called from a savepoint, so the failed INSERT is rolled back and this
+    connection is usable again. Without the savepoint the transaction is aborted
+    and the only possible answer is an error, which is how a retry ends up looking
+    like a conflict with itself.
+    """
+    if client_id is None:
+        raise ResourceIdentityConflict("could not create that resource") from exc
+    cur = await conn.execute(
+        f"select {columns}, creation_fingerprint from {table} where client_id = %s",
+        (client_id,),
+    )
+    winner = await cur.fetchone()
+    if winner is None:
+        # The winner is in another tenant, so invisible here. Nothing about it may
+        # be disclosed, and it cannot be replayed against.
+        raise ResourceIdentityConflict("could not create that resource") from exc
+    stored = winner.pop("creation_fingerprint")
+    if stored is None or bytes(stored) != (fingerprint or b""):
+        raise ResourceIdentityConflict(
+            "that client_id is already used in this tenant by a different operation"
+        ) from exc
+    return winner, True
 
 
 async def create_project(
@@ -122,6 +161,7 @@ async def create_project(
             return existing, True
 
     try:
+      async with conn.transaction():          # savepoint: a lost race must not abort us
         cur = await conn.execute(
             "insert into blocks.projects (tenant_id, client_id, name, creation_fingerprint)"
             " values (%s, %s, %s, %s)"
@@ -129,12 +169,19 @@ async def create_project(
             (tenant_id, client_id, name, fingerprint),
         )
     except psycopg.errors.UniqueViolation as exc:
-        # Only reachable as a race: two concurrent creates with the same client_id
-        # in the SAME tenant, both past the lookup above. Tenant-scoped, so it
-        # discloses nothing outside the tenant.
-        raise ResourceIdentityConflict(
-            "that client_id is already used in this tenant"
-        ) from exc
+        # THE RACE. Two simultaneous requests both pass the lookup above seeing
+        # nothing, and one wins the unique index. The loser is here -- and it is
+        # NOT necessarily a conflict: if it is the same operation retried, it is a
+        # replay, and answering 409 would tell a client its own retry conflicted
+        # with itself.
+        #
+        # Losing the insert is therefore a question, not an answer. Re-read the
+        # winner's row and compare identities: same operation converges to a
+        # replay, different operation is the genuine conflict.
+        row, replayed = await _resolve_identity_race(
+            conn, PROJECT_COLUMNS, "blocks.projects", client_id, fingerprint, exc
+        )
+        return row, replayed
     row = await cur.fetchone()
     assert row is not None
     # The notes row is created by the `projects_ensure_notes` trigger (0008), not
@@ -349,6 +396,7 @@ async def append_parking(
     sequence = (await cur.fetchone())["n"]
 
     try:
+      async with conn.transaction():          # savepoint: a lost race must not abort us
         cur = await conn.execute(
             "insert into blocks.parking_records"
             " (tenant_id, project_id, client_id, where_i_am, next_physical_action,"
@@ -364,9 +412,19 @@ async def append_parking(
             ),
         )
     except psycopg.errors.UniqueViolation as exc:
-        raise ResourceIdentityConflict(
-            "that client_id is already used in this tenant"
-        ) from exc
+        # Two different unique constraints can fire here and they mean opposite
+        # things to a client. Telling someone to fix their client_id when they
+        # actually double-superseded a record sends them to repair the wrong
+        # thing, so the constraint name is checked rather than assumed.
+        if _violated(exc) == "parking_records_supersedes_once":
+            raise IllegalTransition(
+                "that parking record has already been superseded; supersede the "
+                "newest record instead"
+            ) from exc
+        row, replayed = await _resolve_identity_race(
+            conn, PARKING_COLUMNS, "blocks.parking_records", client_id, fingerprint, exc
+        )
+        return row, replayed
     row = await cur.fetchone()
     assert row is not None
     await events.emit(

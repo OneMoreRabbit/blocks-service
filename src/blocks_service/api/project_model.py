@@ -1,4 +1,4 @@
-"""The 0.3 project surface (ADR-0009): dashboard, project page, notes, parking.
+"""The project surface (ADR-0009, extended by ADR-0011): dashboard, page, notes, parking.
 
 Opening a project is **navigation**. There is no endpoint here that starts,
 resumes or closes anything, because selecting a project must never mutate server
@@ -50,7 +50,7 @@ def _replay_responses(model: str) -> dict:
         }
     }
 
-router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects", tags=["projects-0.3"])
+router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects", tags=["projects"])
 
 
 class _ResourceReplay(Exception):

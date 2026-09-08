@@ -103,10 +103,34 @@ class Idempotency:
             )
 
         body = await produce()
-        await self._conn.execute(
-            "insert into blocks.idempotency_keys"
-            " (tenant_id, key, fingerprint, status_code, response)"
-            " values (%s, %s, %s, %s, %s)",
-            (self._tenant_id, self._key, self._fingerprint, status_code, json.dumps(body)),
-        )
+        try:
+            async with self._conn.transaction():   # savepoint: see below
+                await self._conn.execute(
+                    "insert into blocks.idempotency_keys"
+                    " (tenant_id, key, fingerprint, status_code, response)"
+                    " values (%s, %s, %s, %s, %s)",
+                    (self._tenant_id, self._key, self._fingerprint, status_code,
+                     json.dumps(body)),
+                )
+        except psycopg.errors.UniqueViolation:
+            # A concurrent request with the same key committed its result while
+            # this one was working. Losing that race is not an error: the other
+            # request is the same operation, and its stored response is the
+            # authoritative one. Replay it byte for byte rather than returning a
+            # second, competing answer to what the client considers one operation.
+            #
+            # The savepoint is what makes this recoverable — without it the failed
+            # insert aborts the transaction and the only possible reply is a 500.
+            cur = await self._conn.execute(
+                "select status_code, response from blocks.idempotency_keys where key = %s",
+                (self._key,),
+            )
+            stored = await cur.fetchone()
+            if stored is not None:
+                return JSONResponse(
+                    status_code=stored["status_code"],
+                    content=stored["response"],
+                    headers={"Idempotent-Replay": "true"},
+                )
+            raise
         return JSONResponse(status_code=status_code, content=body)

@@ -594,3 +594,80 @@ def test_the_invariant_fails_closed_without_a_tenant_context(legacy_db):
                 (tenant,),
             )
         conn.execute("alter table blocks.projects force row level security")
+
+
+def test_0010_upgrades_a_database_holding_eligible_0009_era_rows(legacy_db):
+    """The boundary 0010 exists to repair, with a row that actually needs repairing.
+
+    The earlier version of 0010 validated the completeness constraint BEFORE
+    backfilling, so a real 0009-era row — fingerprint set, client_id still null —
+    violated it and the migration died at exactly the boundary it was written for.
+    Every test passed anyway, because none of them ever created such a row.
+    """
+    _apply(legacy_db, TARGET)       # 0007
+    _apply(legacy_db, INVARIANT)    # 0008
+    _apply(legacy_db, IDENTITY)     # 0009 — creation identity exists, client_id does not
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.projects no force row level security")
+        conn.execute("alter table blocks.parking_records no force row level security")
+        # project_notes too: inserting a project fires ensure_project_notes, which
+        # runs under the caller's policies and has no tenant context here.
+        conn.execute("alter table blocks.project_notes no force row level security")
+        # A project created the 0009 way: the client's value IS the id, and a
+        # fingerprint records the operation that made it.
+        eligible = conn.execute(
+            "insert into blocks.projects (tenant_id, name, creation_fingerprint)"
+            " select tenant_id, '0009-era', '\\x0badc0de'::bytea from blocks.projects limit 1"
+            " returning id, tenant_id"
+        ).fetchone()
+        conn.execute(
+            "insert into blocks.parking_records (tenant_id, project_id, where_i_am,"
+            " next_physical_action, must_not_forget, authored_by_user_id, sequence,"
+            " occurred_at, creation_fingerprint)"
+            " select %s, %s, '0009-era park','a','b', id, 99, now(), '\\x0badc0de'::bytea"
+            "   from blocks.users limit 1",
+            (eligible["tenant_id"], eligible["id"]),
+        )
+        conn.execute("alter table blocks.project_notes force row level security")
+        conn.execute("alter table blocks.parking_records force row level security")
+        conn.execute("alter table blocks.projects force row level security")
+
+    _apply(legacy_db, SCOPED)       # 0010 — must survive this
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.projects no force row level security")
+        conn.execute("alter table blocks.parking_records no force row level security")
+        for table in ("projects", "parking_records"):
+            mapped = conn.execute(
+                f"select count(*) as n from blocks.{table}"
+                " where creation_fingerprint is not null and client_id is distinct from id"
+            ).fetchone()["n"]
+            assert mapped == 0, f"{table}: eligible rows must map client_id = id"
+            stray = conn.execute(
+                f"select count(*) as n from blocks.{table}"
+                " where creation_fingerprint is null and client_id is not null"
+            ).fetchone()["n"]
+            assert stray == 0, f"{table}: null-fingerprint rows must stay null"
+            validated = conn.execute(
+                "select bool_and(convalidated) as v from pg_constraint"
+                f" where conrelid = ('blocks.{table}')::regclass"
+                "   and conname like '%client_identity_complete'"
+            ).fetchone()["v"]
+            assert validated, f"{table}: the constraint must end up VALIDATED"
+        conn.execute("alter table blocks.parking_records force row level security")
+        conn.execute("alter table blocks.projects force row level security")
+
+    # Tenant uniqueness and forced RLS both intact afterwards.
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        idx = {r["indexname"] for r in conn.execute(
+            "select indexname from pg_indexes where schemaname='blocks'"
+            " and indexname like '%tenant_client_id_key'").fetchall()}
+        assert len(idx) == 2, idx
+        forced = conn.execute(
+            "select bool_and(relforcerowsecurity) as f from pg_class"
+            " where relnamespace='blocks'::regnamespace and relkind='r'"
+            "   and relname in ('projects','parking_records')").fetchone()["f"]
+        assert forced, "forced RLS must be restored"
