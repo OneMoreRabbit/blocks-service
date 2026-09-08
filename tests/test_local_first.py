@@ -471,35 +471,47 @@ async def test_a_create_without_a_client_id_stores_no_creation_identity(client, 
 
 @pytest.fixture
 def contested(monkeypatch):
-    """Force two requests to reach the idempotency decision simultaneously.
+    """Hold every caller at the exact contested point: the missing-key read.
 
     `asyncio.gather` alone proves nothing here: the event loop is free to run one
     request to completion before starting the other, and a sequential schedule
-    makes the second request read a stored result through the ordinary path. The
-    defect lives in the window where BOTH callers have passed the "no result yet"
-    decision, so the test has to hold them there rather than hope.
+    makes the second request read a stored result through the ordinary path.
 
-    A barrier inside `Idempotency.run` does exactly that, patched test-side so no
-    production seam exists for it.
+    Nor is it enough to hold callers at the entry to `Idempotency.run` — they
+    could still serialise across the key lookup, so the test would not have shown
+    that both of them saw no result. The defect lives in the window that opens
+    when the lookup returns nothing and closes when the reservation is inserted,
+    so the barrier belongs inside that window and nowhere else.
+
+    The interception is therefore on `_read`, and only on a read that found
+    nothing. `arrived` counts callers that have seen no result, and none of them
+    is released until all of them have: when a caller returns from `_read`, every
+    participant is provably past the missing-key decision and none has attempted
+    its insert. Patched test-side, so no production seam exists for it.
+
+    The losing side of a unique violation re-reads and finds the winner's row.
+    That is not a missing-key read, so it never touches the barrier.
     """
     import asyncio
 
     from blocks_service.idempotency import Idempotency
 
-    original = Idempotency.run
+    original = Idempotency._read
 
     def arm(participants: int):
         gate = asyncio.Event()
         arrived = []
 
-        async def barriered(self, status_code, produce):
-            arrived.append(1)
-            if len(arrived) >= participants:
-                gate.set()
-            await asyncio.wait_for(gate.wait(), timeout=10)
-            return await original(self, status_code, produce)
+        async def barriered(self):
+            stored = await original(self)
+            if stored is None:
+                arrived.append(1)
+                if len(arrived) >= participants:
+                    gate.set()
+                await asyncio.wait_for(gate.wait(), timeout=10)
+            return stored
 
-        monkeypatch.setattr(Idempotency, "run", barriered)
+        monkeypatch.setattr(Idempotency, "_read", barriered)
         return arrived
 
     return arm
@@ -543,6 +555,13 @@ async def test_identical_simultaneous_creates_converge_to_one_row(
             "select count(*) as n from blocks.outbox where event_type = 'project.created'"
         )
         assert (await cur.fetchone())["n"] == 1, "one create, one event"
+        cur = await conn.execute(
+            "select status_code, response from blocks.idempotency_keys"
+        )
+        results = await cur.fetchall()
+    assert len(results) == 1, "one reservation, one stored result"
+    assert results[0]["status_code"] == 201
+    assert results[0]["response"] == responses[0].json(), "the stored result is the 201"
 
 
 async def test_simultaneous_same_key_different_body_writes_only_one_resource(
@@ -616,12 +635,18 @@ async def test_identical_simultaneous_parks_converge_to_one_record(
             "select count(*) as n from blocks.outbox where event_type = 'project.parked'"
         )
         assert (await cur.fetchone())["n"] == 1, "one park, one event"
+        cur = await conn.execute("select status_code, response from blocks.idempotency_keys")
+        results = await cur.fetchall()
+    assert len(results) == 1, "one reservation, one stored result"
+    assert results[0]["status_code"] == 201
+    assert results[0]["response"] == responses[0].json(), "the stored result is the 201"
 
 
 async def test_simultaneous_park_same_key_different_body_writes_one_record(
-    client, auth, contested
+    client, auth, contested, db: Database
 ):
     tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
     project = (await client.post(
         f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
     )).json()["id"]
@@ -633,9 +658,20 @@ async def test_simultaneous_park_same_key_different_body_writes_one_record(
         (headers, {**PARK, "client_id": str(uuid.uuid4()), "where_i_am": "one"}),
         (headers, {**PARK, "client_id": str(uuid.uuid4()), "where_i_am": "two"}),
     ])
-    assert len(arrived) == 2
+    assert len(arrived) == 2, "both callers must have reached the contested decision"
     assert sorted(r.status_code for r in responses) == [201, 409]
     assert len((await client.get(path, headers=auth("alice"))).json()) == 1
+
+    winner = next(r for r in responses if r.status_code == 201)
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'project.parked'"
+        )
+        assert (await cur.fetchone())["n"] == 1, "no orphan event from the loser"
+        cur = await conn.execute("select status_code, response from blocks.idempotency_keys")
+        results = await cur.fetchall()
+    assert len(results) == 1, "the loser reserved nothing"
+    assert results[0]["response"] == winner.json(), "the stored result is the winner's"
 
 
 async def test_simultaneous_parks_same_client_id_different_keys_yields_one_winner(
@@ -699,6 +735,15 @@ async def test_the_stored_result_belongs_to_the_winner_and_replays_exactly(
     assert replay.headers.get("Idempotent-Replay") == "true"
     assert replay.headers.get("Idempotent-Replay-Source") is None, (
         "this is the retained result, not the post-expiry resource replay"
+    )
+
+    other = losing_body if body is winning_body else winning_body
+    refused = await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=headers, json=other
+    )
+    assert refused.status_code == 409, (
+        "the retained fingerprint is the winner's -- the loser's body is still "
+        "a different operation under this key, and always will be"
     )
 
     loser = next(r for r in responses if r.status_code == 409)
