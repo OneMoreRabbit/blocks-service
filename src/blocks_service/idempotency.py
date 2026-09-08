@@ -81,56 +81,97 @@ class Idempotency:
     async def run(
         self, status_code: int, produce: Callable[[], Awaitable[dict]]
     ) -> JSONResponse:
+        """Reserve the key, then execute. Never the other way round.
+
+        The ordering is the whole safety property. An earlier version executed
+        `produce()` first and arbitrated afterwards, which is safe sequentially and
+        wrong under simultaneous delivery: two requests sharing a key but not a
+        body both found no result, both created a resource and an outbox event, and
+        the loser rolled back only its *key* insert -- committing its extra domain
+        writes and returning the winner's answer. One operation key, two resources,
+        and nothing told the caller.
+
+        Claiming first means at most one request is ever entitled to execute.
+        PostgreSQL supplies the barrier: a second inserter of the same key blocks
+        on the unique index until the first transaction commits or aborts, so it
+        *learns* the outcome instead of racing it. A waiter therefore always reads
+        a completed result -- a reservation that never completes was rolled back
+        together with the work it was reserving.
+        """
         if self._key is None:
             return JSONResponse(status_code=status_code, content=await produce())
 
+        stored = await self._read()
+        if stored is not None:
+            return self._replay(stored)
+
+        try:
+            async with self._conn.transaction():   # savepoint: a lost claim is not fatal
+                await self._conn.execute(
+                    "insert into blocks.idempotency_keys (tenant_id, key, fingerprint)"
+                    " values (%s, %s, %s)",
+                    (self._tenant_id, self._key, self._fingerprint),
+                )
+        except psycopg.errors.UniqueViolation:
+            # Someone else owns this key and has now committed. Re-read and decide
+            # WITHOUT executing: that is the point of claiming first.
+            stored = await self._read()
+            if stored is None:
+                raise
+            return self._replay(stored)
+
+        body = await produce()
+        await self._conn.execute(
+            "update blocks.idempotency_keys set status_code = %s, response = %s"
+            " where key = %s and status_code is null",
+            (status_code, json.dumps(body), self._key),
+        )
+        return JSONResponse(status_code=status_code, content=body)
+
+    async def complete(self, status_code: int, body: dict) -> None:
+        """Record the outcome against a reservation this request already holds.
+
+        Needed because a handler can finish by a path that does not return through
+        `run()` -- a resource replay raises past it. Without this the reservation
+        would commit with no result, and the next retry of that key would read a
+        row it cannot replay from.
+        """
+        if self._key is None:
+            return
+        await self._conn.execute(
+            "update blocks.idempotency_keys set status_code = %s, response = %s"
+            " where key = %s and status_code is null",
+            (status_code, json.dumps(body), self._key),
+        )
+
+    async def _read(self) -> dict | None:
         cur = await self._conn.execute(
             "select fingerprint, status_code, response from blocks.idempotency_keys"
             " where key = %s",
             (self._key,),
         )
-        existing = await cur.fetchone()
-        if existing is not None:
-            if bytes(existing["fingerprint"]) != self._fingerprint:
-                raise errors.conflict(
-                    "This Idempotency-Key was already used for a different request. "
-                    "Use a fresh key per distinct operation."
-                )
-            return JSONResponse(
-                status_code=existing["status_code"],
-                content=existing["response"],
-                headers={"Idempotent-Replay": "true"},
-            )
+        return await cur.fetchone()
 
-        body = await produce()
-        try:
-            async with self._conn.transaction():   # savepoint: see below
-                await self._conn.execute(
-                    "insert into blocks.idempotency_keys"
-                    " (tenant_id, key, fingerprint, status_code, response)"
-                    " values (%s, %s, %s, %s, %s)",
-                    (self._tenant_id, self._key, self._fingerprint, status_code,
-                     json.dumps(body)),
-                )
-        except psycopg.errors.UniqueViolation:
-            # A concurrent request with the same key committed its result while
-            # this one was working. Losing that race is not an error: the other
-            # request is the same operation, and its stored response is the
-            # authoritative one. Replay it byte for byte rather than returning a
-            # second, competing answer to what the client considers one operation.
-            #
-            # The savepoint is what makes this recoverable — without it the failed
-            # insert aborts the transaction and the only possible reply is a 500.
-            cur = await self._conn.execute(
-                "select status_code, response from blocks.idempotency_keys where key = %s",
-                (self._key,),
+    def _replay(self, stored: dict) -> JSONResponse:
+        """Replay a completed result, or refuse a different operation under one key.
+
+        The fingerprint comparison happens here and only here, so a waiter cannot
+        reach `produce()` by a path that skips it -- which is exactly how the
+        previous version returned the winner's answer to a caller who had asked
+        for something else.
+        """
+        if bytes(stored["fingerprint"]) != self._fingerprint:
+            raise errors.conflict(
+                "This Idempotency-Key was already used for a different request. "
+                "Use a fresh key per distinct operation."
             )
-            stored = await cur.fetchone()
-            if stored is not None:
-                return JSONResponse(
-                    status_code=stored["status_code"],
-                    content=stored["response"],
-                    headers={"Idempotent-Replay": "true"},
-                )
-            raise
-        return JSONResponse(status_code=status_code, content=body)
+        if stored["status_code"] is None:
+            # Unreachable in practice: a reservation is only visible to another
+            # transaction once its own committed, and that commit carries the
+            # result. Refusing beats inventing a response if it ever happens.
+            raise errors.conflict("that operation is still in progress; retry")
+        return JSONResponse(
+            status_code=stored["status_code"],
+            content=stored["response"],
+            headers={"Idempotent-Replay": "true"},
+        )

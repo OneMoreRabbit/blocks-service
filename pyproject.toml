@@ -25,4 +25,9 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "session"
+# Fixtures must share the test's event loop. With a session-scoped fixture loop,
+# the connection pool `client` opens has its worker tasks on a loop that is not
+# running during the test, so the pool can never grow past the one connection it
+# pre-opened -- every request serialises and no concurrency test can observe a
+# race. Both async fixtures here are function-scoped; `settings` is synchronous.
+asyncio_default_fixture_loop_scope = "function"

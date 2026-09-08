@@ -469,84 +469,250 @@ async def test_a_create_without_a_client_id_stores_no_creation_identity(client, 
 # own pooled connection, for the lookup-then-insert window to open at all.
 
 
-async def _gather(client, path, headers_bodies):
+@pytest.fixture
+def contested(monkeypatch):
+    """Force two requests to reach the idempotency decision simultaneously.
+
+    `asyncio.gather` alone proves nothing here: the event loop is free to run one
+    request to completion before starting the other, and a sequential schedule
+    makes the second request read a stored result through the ordinary path. The
+    defect lives in the window where BOTH callers have passed the "no result yet"
+    decision, so the test has to hold them there rather than hope.
+
+    A barrier inside `Idempotency.run` does exactly that, patched test-side so no
+    production seam exists for it.
+    """
+    import asyncio
+
+    from blocks_service.idempotency import Idempotency
+
+    original = Idempotency.run
+
+    def arm(participants: int):
+        gate = asyncio.Event()
+        arrived = []
+
+        async def barriered(self, status_code, produce):
+            arrived.append(1)
+            if len(arrived) >= participants:
+                gate.set()
+            await asyncio.wait_for(gate.wait(), timeout=10)
+            return await original(self, status_code, produce)
+
+        monkeypatch.setattr(Idempotency, "run", barriered)
+        return arrived
+
+    return arm
+
+
+async def _both(client, path, headers_bodies):
     import asyncio
 
     return await asyncio.gather(
-        *(client.post(path, headers=h, json=b) for h, b in headers_bodies)
+        *(client.post(path, headers=h, json=b) for h, b in headers_bodies),
+        return_exceptions=True,
     )
 
 
-async def test_identical_simultaneous_creates_converge_to_one_row(client, auth):
+async def test_identical_simultaneous_creates_converge_to_one_row(
+    client, auth, contested, db: Database
+):
+    arrived = contested(2)
     tenant = await _tenant(client, auth)
     cid, key = str(uuid.uuid4()), "race-" + uuid.uuid4().hex[:6]
     headers = {**auth("alice"), "Idempotency-Key": key}
     body = {"client_id": cid, "name": "Kitchen rewire"}
 
-    responses = await _gather(
+    responses = await _both(
         client, f"/v1/tenants/{tenant}/projects", [(headers, body), (headers, body)]
     )
+    assert len(arrived) == 2, "both callers must have reached the contested decision"
 
     codes = sorted(r.status_code for r in responses)
     assert 409 not in codes, "a retry racing itself must never conflict with itself"
-    assert codes in ([200, 201], [201, 201]), codes
-    assert {r.json()["id"] for r in responses} == {responses[0].json()["id"]}, "one identity"
+    assert codes == [201, 201], f"the waiter replays the retained 201, not a 200: {codes}"
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert any(r.headers.get("Idempotent-Replay") == "true" for r in responses)
 
     listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
     assert len(listed.json()) == 1, "exactly one row"
 
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'project.created'"
+        )
+        assert (await cur.fetchone())["n"] == 1, "one create, one event"
 
-async def test_simultaneous_same_key_different_body_yields_one_winner(client, auth):
+
+async def test_simultaneous_same_key_different_body_writes_only_one_resource(
+    client, auth, contested, db: Database
+):
+    """The blocker, exactly: the loser must not commit a second project or event."""
+    arrived = contested(2)
     tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
     key = "race-" + uuid.uuid4().hex[:6]
     headers = {**auth("alice"), "Idempotency-Key": key}
 
-    responses = await _gather(client, f"/v1/tenants/{tenant}/projects", [
+    responses = await _both(client, f"/v1/tenants/{tenant}/projects", [
         (headers, {"client_id": str(uuid.uuid4()), "name": "one"}),
         (headers, {"client_id": str(uuid.uuid4()), "name": "two"}),
     ])
-    codes = sorted(r.status_code for r in responses)
-    assert codes == [201, 409], codes
+    assert len(arrived) == 2
+    assert sorted(r.status_code for r in responses) == [201, 409]
 
     listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
-    assert len(listed.json()) == 1, "one winner, not two rows"
+    assert len(listed.json()) == 1, "the loser must not have committed a second project"
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'project.created'"
+        )
+        events = (await cur.fetchone())["n"]
+        cur = await conn.execute("select count(*) as n from blocks.idempotency_keys")
+        keys = (await cur.fetchone())["n"]
+    assert events == 1, "no orphan outbox event from the losing operation"
+    assert keys == 1, "exactly one reservation"
 
 
-async def test_simultaneous_same_client_id_different_keys_yields_one_winner(client, auth):
+async def test_simultaneous_same_client_id_different_keys_yields_one_winner(
+    client, auth, contested
+):
+    arrived = contested(2)
     tenant = await _tenant(client, auth)
     cid = str(uuid.uuid4())
 
-    responses = await _gather(client, f"/v1/tenants/{tenant}/projects", [
+    responses = await _both(client, f"/v1/tenants/{tenant}/projects", [
         ({**auth("alice"), "Idempotency-Key": "key-a"}, {"client_id": cid, "name": "one"}),
         ({**auth("alice"), "Idempotency-Key": "key-b"}, {"client_id": cid, "name": "two"}),
     ])
-    codes = sorted(r.status_code for r in responses)
-    assert codes == [201, 409], codes
-
+    assert len(arrived) == 2
+    assert sorted(r.status_code for r in responses) == [201, 409]
     listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
     assert len(listed.json()) == 1
 
 
-async def test_identical_simultaneous_parks_converge_to_one_record(client, auth):
+async def test_identical_simultaneous_parks_converge_to_one_record(
+    client, auth, contested, db: Database
+):
+    tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    project = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
+    )).json()["id"]
+    path = f"/v1/tenants/{tenant}/projects/{project}/parking"
+    headers = {**auth("alice"), "Idempotency-Key": "park-race"}
+    body = {**PARK, "client_id": str(uuid.uuid4())}
+
+    arrived = contested(2)   # armed after setup, so only the parks contend
+    responses = await _both(client, path, [(headers, body), (headers, body)])
+    assert len(arrived) == 2
+    assert 409 not in [r.status_code for r in responses]
+    assert len((await client.get(path, headers=auth("alice"))).json()) == 1
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'project.parked'"
+        )
+        assert (await cur.fetchone())["n"] == 1, "one park, one event"
+
+
+async def test_simultaneous_park_same_key_different_body_writes_one_record(
+    client, auth, contested
+):
     tenant = await _tenant(client, auth)
     project = (await client.post(
         f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
     )).json()["id"]
     path = f"/v1/tenants/{tenant}/projects/{project}/parking"
-    cid = str(uuid.uuid4())
-    headers = {**auth("alice"), "Idempotency-Key": "park-race"}
-    body = {**PARK, "client_id": cid}
+    headers = {**auth("alice"), "Idempotency-Key": "park-clash"}
 
-    responses = await _gather(client, path, [(headers, body), (headers, body)])
-    assert 409 not in [r.status_code for r in responses]
+    arrived = contested(2)
+    responses = await _both(client, path, [
+        (headers, {**PARK, "client_id": str(uuid.uuid4()), "where_i_am": "one"}),
+        (headers, {**PARK, "client_id": str(uuid.uuid4()), "where_i_am": "two"}),
+    ])
+    assert len(arrived) == 2
+    assert sorted(r.status_code for r in responses) == [201, 409]
     assert len((await client.get(path, headers=auth("alice"))).json()) == 1
 
 
-async def test_the_service_still_works_after_every_race(client, auth):
-    """No transaction left aborted and no partial idempotency state behind."""
+async def test_simultaneous_parks_same_client_id_different_keys_yields_one_winner(
+    client, auth, contested, db: Database
+):
+    tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    project = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "P"}
+    )).json()["id"]
+    path = f"/v1/tenants/{tenant}/projects/{project}/parking"
+    cid = str(uuid.uuid4())
+
+    arrived = contested(2)
+    responses = await _both(client, path, [
+        ({**auth("alice"), "Idempotency-Key": "park-a"}, {**PARK, "client_id": cid, "where_i_am": "one"}),
+        ({**auth("alice"), "Idempotency-Key": "park-b"}, {**PARK, "client_id": cid, "where_i_am": "two"}),
+    ])
+    assert len(arrived) == 2, "both callers must have reached the contested decision"
+    assert sorted(r.status_code for r in responses) == [201, 409]
+    assert len((await client.get(path, headers=auth("alice"))).json()) == 1
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'project.parked'"
+        )
+        assert (await cur.fetchone())["n"] == 1, "one park, one event"
+
+
+async def test_the_stored_result_belongs_to_the_winner_and_replays_exactly(
+    client, auth, contested
+):
+    """After a contested key, the retained result is the winner's -- byte for byte.
+
+    The loser conflicted without executing, so nothing of its operation may
+    survive in the reservation. A later retry of the winning request has to get
+    the winner's original 201 bytes back, not a re-execution and not the loser's.
+    """
+    arrived = contested(2)
     tenant = await _tenant(client, auth)
     key = "race-" + uuid.uuid4().hex[:6]
-    await _gather(client, f"/v1/tenants/{tenant}/projects", [
+    headers = {**auth("alice"), "Idempotency-Key": key}
+    winning_body = {"client_id": str(uuid.uuid4()), "name": "one"}
+    losing_body = {"client_id": str(uuid.uuid4()), "name": "two"}
+
+    responses = await _both(
+        client, f"/v1/tenants/{tenant}/projects",
+        [(headers, winning_body), (headers, losing_body)],
+    )
+    assert len(arrived) == 2
+    winner = next(r for r in responses if r.status_code == 201)
+    won = winner.json()["client_id"]
+    assert won in (winning_body["client_id"], losing_body["client_id"])
+    body = winning_body if won == winning_body["client_id"] else losing_body
+
+    replay = await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=headers, json=body
+    )
+    assert replay.status_code == 201, "the retained result replays as the original 201"
+    assert replay.json() == winner.json(), "byte-for-byte the winner's response"
+    assert replay.headers.get("Idempotent-Replay") == "true"
+    assert replay.headers.get("Idempotent-Replay-Source") is None, (
+        "this is the retained result, not the post-expiry resource replay"
+    )
+
+    loser = next(r for r in responses if r.status_code == 409)
+    assert loser.json()["error"]["code"] == "conflict"
+    listed = await client.get(f"/v1/tenants/{tenant}/projects", headers=auth("alice"))
+    assert [p["client_id"] for p in listed.json()] == [won], "only the winner exists"
+
+
+async def test_the_service_still_works_after_every_race(client, auth, contested):
+    """No transaction left aborted and no partial reservation behind."""
+    tenant = await _tenant(client, auth)
+    key = "race-" + uuid.uuid4().hex[:6]
+    contested(2)
+    await _both(client, f"/v1/tenants/{tenant}/projects", [
         ({**auth("alice"), "Idempotency-Key": key}, {"client_id": str(uuid.uuid4()), "name": "a"}),
         ({**auth("alice"), "Idempotency-Key": key}, {"client_id": str(uuid.uuid4()), "name": "b"}),
     ])
@@ -554,6 +720,22 @@ async def test_the_service_still_works_after_every_race(client, auth):
         f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "after"}
     )
     assert after.status_code == 201, "the service must be usable after a lost race"
+
+
+async def test_a_stored_result_is_never_rewritten(client, auth, db: Database):
+    """0011 grants a narrow UPDATE; the result stays write-once, enforced in the database."""
+    tenant = await _tenant(client, auth)
+    actor = (await client.post("/v1/session", headers=auth("alice"))).json()["user_id"]
+    await client.post(
+        f"/v1/tenants/{tenant}/projects",
+        headers={**auth("alice"), "Idempotency-Key": "once"}, json={"name": "P"},
+    )
+    async with db.tenant_transaction(tenant, actor) as conn:
+        with pytest.raises(psycopg.errors.Error):
+            async with conn.transaction():
+                await conn.execute(
+                    "update blocks.idempotency_keys set status_code = 500 where key = 'once'"
+                )
 
 
 async def test_superseding_the_same_record_twice_is_not_a_client_id_error(client, auth):

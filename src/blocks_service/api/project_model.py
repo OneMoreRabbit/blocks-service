@@ -66,6 +66,10 @@ class _ResourceReplay(Exception):
     def __init__(self, body: dict) -> None:
         self._body = body
 
+    @property
+    def body(self) -> dict:
+        return self._body
+
     def response(self) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_200_OK,
@@ -252,6 +256,10 @@ async def create_project(
     try:
         return await idem.run(status.HTTP_201_CREATED, produce)
     except _ResourceReplay as replay:
+        # This request holds the key reservation and is finishing without going
+        # back through run(), so it records its own outcome. Otherwise the
+        # reservation commits with no result and the next retry cannot replay it.
+        await idem.complete(status.HTTP_200_OK, replay.body)
         return replay.response()
 
 
@@ -436,6 +444,10 @@ async def add_parking(
     try:
         return await idem.run(status.HTTP_201_CREATED, produce)
     except _ResourceReplay as replay:
+        # This request holds the key reservation and is finishing without going
+        # back through run(), so it records its own outcome. Otherwise the
+        # reservation commits with no result and the next retry cannot replay it.
+        await idem.complete(status.HTTP_200_OK, replay.body)
         return replay.response()
 
 

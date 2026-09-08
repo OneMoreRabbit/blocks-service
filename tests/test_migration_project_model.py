@@ -19,11 +19,12 @@ from psycopg.rows import dict_row
 
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
-EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008", "0009", "0010"))]
+EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008", "0009", "0010", "0011"))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
 SCOPED = EXPAND[3]        # 0010 — tenant-scoped client identity
+RESERVE = EXPAND[4]       # 0011 — idempotency reservation
 SCRATCH = "blocks_migration_drill"
 
 
@@ -470,7 +471,8 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
 
     _apply(legacy_db, INVARIANT)                    # 0008 heals it
     _apply(legacy_db, IDENTITY)                     # 0009
-    _apply(legacy_db, SCOPED)                       # 0010 completes the expand step
+    _apply(legacy_db, SCOPED)                       # 0010
+    _apply(legacy_db, RESERVE)                      # 0011 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
@@ -635,6 +637,7 @@ def test_0010_upgrades_a_database_holding_eligible_0009_era_rows(legacy_db):
         conn.execute("alter table blocks.projects force row level security")
 
     _apply(legacy_db, SCOPED)       # 0010 — must survive this
+    _apply(legacy_db, RESERVE)      # 0011
 
     with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
         conn.execute("set role blocks_owner")
