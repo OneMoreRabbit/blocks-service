@@ -37,8 +37,20 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+#: Superseded contracts and the sidecars only they declare live under
+#: provides/archive/. Archiving is a filing decision, not a withdrawal: the bytes
+#: consumers were handed are unchanged and every assertion below still applies to
+#: them, so resolution follows the file rather than assuming the live directory.
+ARCHIVE = PROVIDES / "archive"
+
+
+def _resolve(name: str) -> pathlib.Path:
+    live = PROVIDES / name
+    return live if live.exists() else ARCHIVE / name
+
+
 def _declared(contract: str) -> list[tuple[str, str]]:
-    frontmatter = (PROVIDES / contract).read_text().split("---")[1]
+    frontmatter = _resolve(contract).read_text().split("---")[1]
     return re.findall(r"- file: (\S+)\n\s+sha256: ([0-9a-f]{64})", frontmatter)
 
 
@@ -55,7 +67,7 @@ def test_every_declared_artifact_exists_with_the_declared_bytes(contract: str):
     guess at bytes it was told to work from.
     """
     for name, declared in _declared(contract):
-        path = PROVIDES / name
+        path = _resolve(name)
         assert path.is_file(), f"{contract} declares {name}, which does not exist"
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         assert actual == declared, f"{name}: declared {declared[:12]}…, actual {actual[:12]}…"
@@ -64,7 +76,9 @@ def test_every_declared_artifact_exists_with_the_declared_bytes(contract: str):
 def test_every_shipped_sidecar_is_declared_by_some_contract():
     """The direction that catches an artefact added and quietly not published."""
     declared = {name for c in CONTRACTS for name, _ in _declared(c)}
-    shipped = {p.name for p in PROVIDES.glob("*.json")}
+    shipped = {p.name for p in PROVIDES.glob("*.json")} | {
+        p.name for p in ARCHIVE.glob("*.json")
+    }
     assert not shipped - declared, f"undeclared sidecars: {sorted(shipped - declared)}"
 
 
@@ -119,5 +133,5 @@ def test_the_superseded_contracts_are_untouched_by_the_current_service():
     """
     for older in ("0_1", "0_2", "0_3"):
         for name, declared in _declared(f"blocks-service-api-contract-v{older}.md"):
-            actual = hashlib.sha256((PROVIDES / name).read_bytes()).hexdigest()
+            actual = hashlib.sha256(_resolve(name).read_bytes()).hexdigest()
             assert actual == declared, f"{name} moved under published {older}"

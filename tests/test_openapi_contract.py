@@ -207,9 +207,14 @@ def test_the_accepted_0_1_schema_names_survive_in_0_2(spec):
     import json
     import pathlib
 
-    published = pathlib.Path(
-        ".atlas/components/blocks-service/docs/provides/blocks-service-api-openapi-v0_1.json"
-    )
+    provides = pathlib.Path(".atlas/components/blocks-service/docs/provides")
+    # Superseded contracts and the sidecars only they declare are filed under
+    # archive/. Archiving is not withdrawal: these are still the bytes a 0.1
+    # consumer generated from, so the assertion must follow the file rather than
+    # quietly skip and stop protecting those names.
+    published = provides / "blocks-service-api-openapi-v0_1.json"
+    if not published.exists():
+        published = provides / "archive" / "blocks-service-api-openapi-v0_1.json"
     if not published.exists():
         pytest.skip("0.1 artefact not present in this checkout")
     accepted = set(json.loads(published.read_text())["components"]["schemas"])
