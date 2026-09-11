@@ -6,13 +6,35 @@ The architecture lives in the project's Atlas vault — a git repo resolved by
 pinned in the vault's `registry/io-graph.yml`. Never reference the vault by a machine path.
 
 **Before working:** read `ATLAS-CONTEXT.md` — injected by the SessionStart hook on every
-session start (including resume, `/clear`, compaction and fork). Regenerate any time with
+session start (including resume, `/clear` and compaction). Regenerate any time with
 `sh scripts/atlas-context.sh`. **If it is absent, your hooks are not live** — the write
 guard is not running either. Fix the install (`atlas_init --launch-dir`, then `--verify`);
 until then honour the write scope by hand. It is your complete reading list: constitution, pinned
 upstream contracts, consumers' needs, in-flight proposals, drift. Consult the wider vault
 only if the context is insufficient — and treat that as a defect in the vault's
 `registry/io-graph.yml`: fix the graph, don't browse.
+
+**The development cycle** — every piece of work runs this loop, in order:
+1. **Review architecture** — constitution and the architecture-in-force index in your briefing.
+2. **Examine your edges** — the contracts under *Inputs* are what you build AGAINST, and
+   your consumers' *needs* are what you owe. Read them, don't scroll past them. Code that
+   contradicts a pinned contract is a defect even if every test passes.
+3. **Develop.**
+4. **Test.**
+5. **Update your own `provides/` and `needs/`** — what changed for consumers, what you
+   now need from providers — and publish. The Stop guard checks this step.
+
+Two rules bind every step: **confirm the issue before you build it** (never develop
+against an assumed problem), and **test against the real environment and its real
+upstream contracts — never an invented fixture.** A green test over a fiction is not
+evidence.
+
+**Your mode** is in `.atlas.conf` (`ATLAS_MODE`, default **supervised**). *Supervised*:
+state the issue and approach and get the operator's OK before developing; publishing or
+releasing (push, PR, tag) will pause for their approval — do not work around it.
+*Autonomous*: run the full cycle and publish through the write model; oversight is the
+cascade and the hub. **House style, always:** plain English, concise; use the method's
+existing terms, coin none; say less.
 
 **While working:** you may write only to `components/blocks-service/**`, an additive
 `architecture/proposals/NNNN-*.md`, and edges in `registry/io-graph.yml` that name you.

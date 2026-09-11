@@ -19,6 +19,15 @@
             "command": "sh \"${CLAUDE_PROJECT_DIR}/scripts/atlas-guard-write.sh\""
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PROJECT_DIR}/scripts/atlas-guard-supervise.sh\""
+          }
+        ]
       }
     ],
     "Stop": [

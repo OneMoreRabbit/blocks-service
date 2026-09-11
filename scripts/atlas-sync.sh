@@ -38,8 +38,8 @@ GRAPH=$(atlas_graph_text "$BWORK")
 PIN=$(printf '%s\n' "$GRAPH" |
       awk '/^method:/{m=1;next} m&&/^[^ ]/{m=0} m&&/pinned:/{gsub(/[^0-9.]/,"",$2); print $2; exit}')
 # Resolve the pin to an IMMUTABLE release tag (method 1.20). Tags never move after
-# release — content that must change takes the next number. A two-part pin (1.20)
-# resolves to the highest v1.20.* patch, visibly; a three-part pin (1.20.1) is exact.
+# release — content that must change takes the next number. A three-part pin (1.20.1)
+# is exact; a two-part pin (1.20) warns and resolves only to its bare vX.Y tag.
 # (A moved tag once left two vaults both honestly pinned 1.16 on different trees, with
 # drift showing green because the NUMBER matched — arc-platform finding, 2026-09-01.)
 # The pin is honoured LITERALLY (release-convention v0.3, operator ruling 2026-09-07,
@@ -125,10 +125,17 @@ fi
 # copies drift (AAC-method §8), so detect it rather than trusting it.
 TPL="$ATLAS_METHOD/templates/component-repo/scripts"
 if [ -d "$TPL" ]; then
-  for f in atlas-common.sh atlas-sync.sh atlas-context.sh atlas-guard-write.sh atlas-guard-publish.sh; do
+  _DRIFTED=0
+  for f in atlas-common.sh atlas-sync.sh atlas-context.sh atlas-guard-write.sh atlas-guard-publish.sh atlas-guard-supervise.sh; do
     [ -f "$TPL/$f" ] || continue
-    [ -f "scripts/$f" ] || { echo "atlas-sync: WARN scripts/$f missing — method ${REF:-default} ships it" >&2; continue; }
+    [ -f "scripts/$f" ] || { echo "atlas-sync: WARN scripts/$f missing — method ${REF:-default} ships it" >&2; _DRIFTED=1; continue; }
     cmp -s "$TPL/$f" "scripts/$f" ||
-      echo "atlas-sync: WARN scripts/$f differs from method ${REF:-default} template — re-copy, or raise a proposal if the change is deliberate" >&2
+      { echo "atlas-sync: WARN scripts/$f differs from method ${REF:-default} template — re-copy, or raise a proposal if the change is deliberate" >&2; _DRIFTED=1; }
   done
+  # The warning carries its own remedy (1.26.2, AgentEco ask): the exact refresh
+  # command, filled in — so no arch seat ever needs to mint a per-release broadcast
+  # (which reliably went stale and then named an OLDER version to install).
+  if [ "$_DRIFTED" = 1 ]; then
+    echo "atlas-sync: refresh with: python3 .atlas-method/tools/atlas_init.py --slug $SLUG --force${ATLAS_LAUNCH_DIR:+ --launch-dir \"$ATLAS_LAUNCH_DIR\"} --vault-remote $ATLAS_VAULT_REMOTE   (then re-run with --verify; commit scripts/)" >&2
+  fi
 fi
