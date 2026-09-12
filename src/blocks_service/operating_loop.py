@@ -171,8 +171,14 @@ async def register_block(
     *,
     client_id: UUID | None = None,
     token: str | None = None,
-) -> tuple[Block, str, bool]:
-    """Register a block. Returns (block, token, replayed).
+) -> tuple[Block, str | None, bool]:
+    """Register a block. Returns (block, minted_token, replayed).
+
+    `minted_token` is the plaintext ONLY for the server-minted 0.4 form, where the
+    caller has no other way to learn it. For the client-supplied form it is
+    `None`: the caller already holds the token, and handing it back would put the
+    raw value into the response -- which idempotency then persists as JSON, so an
+    echo is not a display decision but a storage one.
 
     Two shapes, and the caller chooses by supplying both client values or neither:
 
@@ -214,7 +220,7 @@ async def register_block(
 
     existing = await _block_by_client_id(conn, client_id)
     if existing is not None:
-        return _replay_or_conflict(existing, fingerprint), token, True
+        return _replay_or_conflict(existing, fingerprint), None, True
 
     try:
         async with conn.transaction():    # savepoint: a lost race must not abort us
@@ -233,7 +239,7 @@ async def register_block(
             winner = await _block_by_client_id(conn, client_id)
             if winner is None:
                 raise
-            return _replay_or_conflict(winner, fingerprint), token, True
+            return _replay_or_conflict(winner, fingerprint), None, True
         if constraint == "physical_blocks_tenant_token_hash_key":
             # This token already belongs to a different block in this tenant. Same
             # conflict shape as any other registration conflict -- the caller is
@@ -246,7 +252,7 @@ async def register_block(
 
     row = await cur.fetchone()
     assert row is not None
-    return Block(**row), token, False
+    return Block(**row), None, False
 
 
 async def _block_by_client_id(
@@ -341,7 +347,35 @@ async def bind_block(
 
     Rebinding appends; it never rewrites history, so work sessions that ran under
     the previous binding keep their meaning.
+
+    **Fail closed.** Both parents are proven visible in THIS tenant before anything
+    is ended or inserted. The earlier order ended the current binding first and
+    only then attempted the insert, so a foreign or invented id could destroy a
+    real binding and *then* fail -- a side effect committed on behalf of a request
+    that was never entitled to be here.
+
+    The check is not belt-and-braces over the foreign keys. `block_id` and
+    `project_id` reference globally keyed parents, so a guessed UUID from another
+    tenant satisfies the constraint while the child row claims the caller's
+    tenant: cross-tenant referential corruption that RLS on the child cannot see.
+    Migration 0012 adds the tenant-composite invariant that refuses it in the
+    database; this is the layer that gives the caller an answer.
+
+    Absent and foreign are the same answer -- `NotFound`, one 404 body -- because
+    distinguishing them is precisely the existence oracle the tenant boundary
+    exists to prevent.
     """
+    cur = await conn.execute(
+        "select"
+        " (select count(*) from blocks.physical_blocks where id = %s) as block,"
+        " (select count(*) from blocks.projects where id = %s) as project",
+        (block_id, project_id),
+    )
+    seen = await cur.fetchone()
+    assert seen is not None
+    if not seen["block"] or not seen["project"]:
+        raise NotFound("block or project not found in this tenant")
+
     await conn.execute(
         "update blocks.block_bindings set is_current = false, ended_at = now()"
         " where block_id = %s and is_current",

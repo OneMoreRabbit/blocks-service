@@ -61,7 +61,7 @@ async def test_a_0_4_registration_still_mints_its_own_token(client, auth):
     r = await _register(client, auth, tenant, label="Workbench")
 
     assert r.status_code == 201
-    assert r.json()["client_id"] is None
+    assert "client_id" not in r.json(), "the 0.4 result shape is unchanged"
     assert len(r.json()["tag_token"]) == 43, "the minted token is canonical too"
 
 
@@ -122,7 +122,10 @@ async def test_an_identical_registration_replays_the_retained_result(client, aut
 
     assert first.status_code == 201
     assert first.json()["client_id"] == body["client_id"]
-    assert first.json()["tag_token"] == body["tag_token"], "the tag's own token, echoed"
+    assert "tag_token" not in first.json(), (
+        "the client already holds the token; echoing it would put the raw value "
+        "into the idempotency result, which is persisted as JSON"
+    )
     assert first.json()["id"] != body["client_id"], "canonical id stays server-generated"
     assert second.status_code == 201
     assert second.json() == first.json()
@@ -412,3 +415,214 @@ async def test_simultaneous_registrations_sharing_a_token_leave_one_block(
     assert sorted(r.status_code for r in responses) == [201, 409]
     listed = await client.get(path, headers=auth("alice"))
     assert len(listed.json()) == 1, "the loser committed no block"
+
+
+# --------------------------------------------------------------------------
+# Binding fails closed, at both layers
+# --------------------------------------------------------------------------
+
+
+async def _block_and_project(client, auth, tenant, who="alice"):
+    block = (await client.post(f"/v1/tenants/{tenant}/blocks", headers=auth(who), json={
+        "label": "Workbench"})).json()["id"]
+    project = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth(who), json={"name": "Kitchen"}
+    )).json()["id"]
+    return block, project
+
+
+@pytest.mark.parametrize("missing", ["block", "project"])
+async def test_binding_an_absent_id_is_404_and_commits_nothing(
+    client, auth, db: Database, missing
+):
+    tenant = await _tenant(client, auth)
+    actor = await _actor(client, auth)
+    block, project = await _block_and_project(client, auth, tenant)
+    if missing == "block":
+        block = str(uuid.uuid4())
+    else:
+        project = str(uuid.uuid4())
+
+    r = await client.post(
+        f"/v1/tenants/{tenant}/blocks/{block}/binding",
+        headers={**auth("alice"), "Idempotency-Key": "bind-miss"},
+        json={"project_id": project},
+    )
+
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "not_found"
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute("select count(*) as n from blocks.block_bindings")
+        assert (await cur.fetchone())["n"] == 0, "no binding row"
+        cur = await conn.execute(
+            "select count(*) as n from blocks.outbox where event_type = 'block.bound'")
+        assert (await cur.fetchone())["n"] == 0, "no outbox effect"
+        cur = await conn.execute("select count(*) as n from blocks.idempotency_keys")
+        assert (await cur.fetchone())["n"] == 0, "no idempotency result retained"
+
+
+@pytest.mark.parametrize("foreign", ["block", "project"])
+async def test_binding_a_foreign_id_answers_exactly_as_an_absent_one(
+    client, auth, db: Database, foreign
+):
+    """The distinction between 'never existed' and 'belongs to someone else' IS the oracle."""
+    mine = await _tenant(client, auth, "alice")
+    actor = await _actor(client, auth, "alice")
+    theirs = await _tenant(client, auth, "bob")
+    block, project = await _block_and_project(client, auth, mine)
+    their_block, their_project = await _block_and_project(client, auth, theirs, "bob")
+    if foreign == "block":
+        block = their_block
+    else:
+        project = their_project
+
+    r = await client.post(
+        f"/v1/tenants/{mine}/blocks/{block}/binding",
+        headers=auth("alice"), json={"project_id": project},
+    )
+    absent = await client.post(
+        f"/v1/tenants/{mine}/blocks/{uuid.uuid4() if foreign == 'block' else block}/binding",
+        headers=auth("alice"),
+        json={"project_id": str(uuid.uuid4()) if foreign == "project" else project},
+    )
+
+    assert r.status_code == 404
+    assert r.json() == absent.json(), "foreign and absent are one indistinguishable answer"
+
+    async with db.tenant_transaction(mine, actor) as conn:
+        cur = await conn.execute("select count(*) as n from blocks.block_bindings")
+        assert (await cur.fetchone())["n"] == 0
+
+
+async def test_a_foreign_bind_does_not_end_an_existing_binding(client, auth, db: Database):
+    """The old order ended the current binding BEFORE it failed."""
+    mine = await _tenant(client, auth, "alice")
+    actor = await _actor(client, auth, "alice")
+    theirs = await _tenant(client, auth, "bob")
+    block, project = await _block_and_project(client, auth, mine)
+    _, their_project = await _block_and_project(client, auth, theirs, "bob")
+
+    ok = await client.post(f"/v1/tenants/{mine}/blocks/{block}/binding",
+                           headers=auth("alice"), json={"project_id": project})
+    assert ok.status_code in (200, 201)
+
+    bad = await client.post(f"/v1/tenants/{mine}/blocks/{block}/binding",
+                            headers=auth("alice"), json={"project_id": their_project})
+    assert bad.status_code == 404
+
+    async with db.tenant_transaction(mine, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.block_bindings where is_current")
+        assert (await cur.fetchone())["n"] == 1, "the real binding survived"
+
+
+async def test_the_database_refuses_a_cross_tenant_binding_directly(
+    client, auth, db: Database
+):
+    """The half that holds when application validation is bypassed."""
+    mine = await _tenant(client, auth, "alice")
+    actor = await _actor(client, auth, "alice")
+    theirs = await _tenant(client, auth, "bob")
+    block, _ = await _block_and_project(client, auth, mine)
+    _, their_project = await _block_and_project(client, auth, theirs, "bob")
+
+    async with db.tenant_transaction(mine, actor) as conn:
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            async with conn.transaction():
+                await conn.execute(
+                    "insert into blocks.block_bindings (tenant_id, block_id, project_id)"
+                    " values (%s, %s, %s)",
+                    (mine, block, their_project),
+                )
+
+
+async def test_valid_bind_rebind_and_unbind_still_work(client, auth, db: Database):
+    tenant = await _tenant(client, auth)
+    actor = await _actor(client, auth)
+    block, first = await _block_and_project(client, auth, tenant)
+    second = (await client.post(
+        f"/v1/tenants/{tenant}/projects", headers=auth("alice"), json={"name": "Loft"}
+    )).json()["id"]
+
+    a = await client.post(f"/v1/tenants/{tenant}/blocks/{block}/binding",
+                          headers=auth("alice"), json={"project_id": first})
+    b = await client.post(f"/v1/tenants/{tenant}/blocks/{block}/binding",
+                          headers=auth("alice"), json={"project_id": second})
+    assert a.status_code in (200, 201) and b.status_code in (200, 201)
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.block_bindings where block_id = %s", (block,))
+        assert (await cur.fetchone())["n"] == 2, "rebinding appends; history is kept"
+        cur = await conn.execute(
+            "select project_id::text as p from blocks.block_bindings"
+            " where block_id = %s and is_current", (block,))
+        rows = await cur.fetchall()
+    assert len(rows) == 1 and rows[0]["p"] == second, "exactly one current binding"
+
+
+# --------------------------------------------------------------------------
+# The raw token really is absent from persistent storage
+# --------------------------------------------------------------------------
+
+
+async def test_the_raw_token_never_reaches_the_idempotency_record(
+    client, auth, db: Database
+):
+    """The claim the first draft got wrong.
+
+    A response is persisted as JSON by the idempotency machinery, so echoing the
+    token would have written the raw value into Service storage — while the
+    contract said storage held only hashes. Not a display decision.
+    """
+    tenant = await _tenant(client, auth)
+    actor = await _actor(client, auth)
+    token = canonical_token()
+    r = await client.post(f"/v1/tenants/{tenant}/blocks",
+                          headers={**auth("alice"), "Idempotency-Key": "store"},
+                          json={"label": "Workbench", "client_id": str(uuid.uuid4()),
+                                "tag_token": token})
+    assert r.status_code == 201
+
+    async with db.tenant_transaction(tenant, actor) as conn:
+        cur = await conn.execute(
+            "select status_code, response::text as body,"
+            " encode(fingerprint,'hex') as fp from blocks.idempotency_keys")
+        stored = await cur.fetchall()
+
+    assert stored, "the result was retained"
+    assert token not in str(stored), "no raw token in the idempotency response or fingerprint"
+
+
+async def test_a_client_form_replay_after_expiry_carries_no_token(
+    client, auth, db: Database
+):
+    tenant = await _tenant(client, auth)
+    actor = await _actor(client, auth)
+    body = {"label": "Workbench", "client_id": str(uuid.uuid4()), "tag_token": canonical_token()}
+    headers = {**auth("alice"), "Idempotency-Key": "exp"}
+    path = f"/v1/tenants/{tenant}/blocks"
+
+    await client.post(path, headers=headers, json=body)
+    await _expire_results(db, tenant, actor)
+    replay = await client.post(path, headers=headers, json=body)
+
+    assert replay.status_code == 200
+    assert "tag_token" not in replay.json()
+    assert replay.json()["client_id"] == body["client_id"]
+    assert replay.headers["Idempotent-Replay-Source"] == "resource"
+
+
+async def test_a_200_character_label_is_accepted_on_the_client_form(client, auth):
+    """Android's local model already accepts 200; 0.4's 120 stays 120."""
+    tenant = await _tenant(client, auth)
+    long_label = "x" * 200
+
+    ok = await client.post(f"/v1/tenants/{tenant}/blocks", headers=auth("alice"), json={
+        "label": long_label, "client_id": str(uuid.uuid4()), "tag_token": canonical_token()})
+    legacy = await client.post(f"/v1/tenants/{tenant}/blocks", headers=auth("alice"),
+                               json={"label": long_label})
+
+    assert ok.status_code == 201, "the local-first form takes the length Android sends"
+    assert legacy.status_code == 400, "the server-minted form keeps its 0.4 limit"

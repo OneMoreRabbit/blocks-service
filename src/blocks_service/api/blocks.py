@@ -10,47 +10,67 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
-from .deps import TenantContext, as_http, idempotency, tenant_context
+from .deps import (
+    TenantContext,
+    as_http,
+    idempotency,
+    replay_responses,
+    tenant_context,
+)
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/blocks", tags=["blocks"])
 
 
-class BlockIn(BaseModel):
+class LegacyBlockIn(BaseModel):
+    """API 0.4 form: Service mints the token and returns it once."""
+
     model_config = ConfigDict(extra="forbid")
     label: str = Field(min_length=1, max_length=120)
-    client_id: UUID | None = Field(
-        default=None,
+
+
+class ClientBlockIn(BaseModel):
+    """API 0.5 form: the tag was already programmed offline (ADR-0014).
+
+    `client_id` and `tag_token` are **both** required here. That is what makes the
+    two forms a closed choice rather than one model with optional halves: half an
+    identity can neither replay nor conflict, and a generator should refuse it
+    before a server has to.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(
+        min_length=1,
+        max_length=200,
         description=(
-            "**Optional client identifier, unique within your tenant.** A local-first "
-            "client mints this before it programs the tag and always supplies it, so a "
-            "registration replayed after any offline period cannot duplicate. It is "
-            "**not** the canonical id: Service still generates that and returns both. "
-            "Supplied together with `tag_token` or not at all. Two tenants may use the "
-            "same value for unrelated blocks, and neither can learn anything about the "
-            "other. Omit both to keep API 0.4 behaviour."
+            "Non-blank, up to 200 characters — the length Android's local model "
+            "already accepts. The 0.4 server-minted form keeps its 120-character limit."
         ),
     )
-    tag_token: str | None = Field(
-        default=None,
+    client_id: UUID = Field(
         description=(
-            "**Optional client-generated tag token**, exactly the canonical "
-            "ADR-0014 value: 32 random bytes as 43 characters of unpadded base64url. "
-            "Send the token only -- never the whole `blocks://tag/v1/<token>` URI. "
-            "Supply it when the tag was already programmed offline, so the value "
-            "physically written to the tag is the one Service records. Service stores "
-            "only its hash and echoes the token back solely in this registration's own "
-            "result. Supplied together with `client_id` or not at all."
+            "**Your identifier for this block, unique within your tenant.** Minted "
+            "before the tag is programmed and always supplied, so a registration "
+            "replayed after any offline period cannot duplicate. It is **not** the "
+            "canonical id: Service generates that and returns both. Two tenants may "
+            "use the same value for unrelated blocks, and neither can learn anything "
+            "about the other."
+        )
+    )
+    tag_token: str = Field(
+        min_length=43,
+        max_length=43,
+        description=(
+            "The canonical ADR-0014 token: 32 random bytes as exactly 43 characters "
+            "of unpadded base64url. Send the token only — never the whole "
+            "`blocks://tag/v1/<token>` URI. A padded or standard-alphabet spelling of "
+            "the same bytes is refused, because two spellings would hash differently "
+            "and one physical tag would become two blocks. Service stores only the "
+            "hash and **never returns this value**: you already hold it."
         ),
     )
 
-    @model_validator(mode="after")
-    def _identity_is_all_or_nothing(self) -> "BlockIn":
-        # Half an identity cannot replay and cannot conflict. Refusing it here
-        # makes the contract state the rule; the 0012 check constraint makes the
-        # database refuse to hold the state at all.
-        if (self.client_id is None) != (self.tag_token is None):
-            raise ValueError("client_id and tag_token are supplied together or both omitted")
-        return self
+
+BlockIn = LegacyBlockIn | ClientBlockIn
 
 
 class BlockOut(BaseModel):
@@ -61,26 +81,36 @@ class BlockOut(BaseModel):
 
 
 class RegisteredBlockOut(BlockOut):
-    client_id: UUID | None = Field(
-        default=None,
-        description="Echoed when you supplied one, so a client can attribute this result.",
-    )
+    """Result of the API 0.4 server-minted form. Unchanged from 0.4."""
+
     tag_token: str = Field(
         description=(
-            "The token for the NFC tag. Returned ONCE, in this registration's own "
-            "result; the service stores only its hash and cannot show it again. When "
-            "you supplied the token, this is that same value echoed back -- Service "
-            "never replaces a token a tag already carries."
+            "The token to write to the NFC tag. Returned ONCE, here, because this "
+            "is the only place a caller of the server-minted form can learn it; the "
+            "service stores only its hash and cannot show it again."
         )
     )
+
+
+class ClientRegisteredBlockOut(BlockOut):
+    """Result of the API 0.5 client-supplied form.
+
+    **No `tag_token`, by construction.** You supplied it, so returning it would add
+    nothing — and it would not merely be displayed: idempotency persists a
+    response as JSON, so echoing the token would write the raw value into Service
+    storage, which is exactly what hashing it was for. `client_id` and the
+    canonical `id` are what a client needs to attribute the acknowledgement and
+    rewrite its dependent binding.
+    """
+
+    client_id: UUID
 
 
 class ReplayedBlockOut(BlockOut):
     """A registration recognised by resource identity after the result expired.
 
-    No `tag_token`. The client that supplied one already has it, and a resource
-    replay is a read of current state rather than the original result -- Service
-    could only reconstruct the token by storing it, which it deliberately does not.
+    Current state, not the original bytes — and no `tag_token` for either form: a
+    resource replay is a read, and the raw token was never stored to re-read.
     """
 
     client_id: UUID | None = None
@@ -134,8 +164,11 @@ class LookupIn(BaseModel):
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    response_model=RegisteredBlockOut,
-    responses=errors.error_responses(400, 401, 403, 409, 426),
+    response_model=RegisteredBlockOut | ClientRegisteredBlockOut,
+    responses={
+        **errors.error_responses(400, 401, 403, 409, 426),
+        **replay_responses(ReplayedBlockOut),
+    },
     summary="Register a physical block",
 )
 async def register(
@@ -143,32 +176,32 @@ async def register(
     ctx: TenantContext = Depends(tenant_context),
     idem: Idempotency = Depends(idempotency),
 ) -> JSONResponse:
+    client_id = getattr(body, "client_id", None)
+
     async def produce() -> dict:
         try:
-            block, token, replayed = await loop.register_block(
+            block, minted, replayed = await loop.register_block(
                 ctx.conn,
                 ctx.tenant_id,
                 body.label,
-                client_id=body.client_id,
-                token=body.tag_token,
+                client_id=client_id,
+                token=getattr(body, "tag_token", None),
             )
         except loop.DomainError as exc:
             raise as_http(exc) from exc
         if replayed:
             raise _ResourceReplay(
                 ReplayedBlockOut(
-                    id=block.id,
-                    label=block.label,
-                    state=block.state,
-                    client_id=body.client_id,
+                    id=block.id, label=block.label, state=block.state, client_id=client_id
                 ).model_dump(mode="json")
             )
+        if client_id is not None:
+            return ClientRegisteredBlockOut(
+                id=block.id, label=block.label, state=block.state, client_id=client_id
+            ).model_dump(mode="json")
+        assert minted is not None
         return RegisteredBlockOut(
-            id=block.id,
-            label=block.label,
-            state=block.state,
-            client_id=body.client_id,
-            tag_token=token,
+            id=block.id, label=block.label, state=block.state, tag_token=minted
         ).model_dump(mode="json")
 
     try:

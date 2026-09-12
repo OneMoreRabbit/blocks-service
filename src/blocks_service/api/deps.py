@@ -202,3 +202,38 @@ def require_supported_client(
         raise errors.invalid_request(
             f"X-Blocks-Client-Version must be a dotted version, not {raw!r}."
         ) from None
+
+
+def replay_responses(model: type) -> dict:
+    """Declare the resource-replay 200 for a route that can return one.
+
+    Takes the model CLASS, not its name. A bare `$ref` to a schema FastAPI never
+    emits — because the model is not a `response_model` anywhere — publishes a
+    dangling reference, which is worse than omitting the response: a generator
+    cannot resolve it and fails on a document that looks complete.
+    """
+    return {
+        200: {
+            "model": model,
+            "description": (
+                "Resource replay. The ordinary idempotency result had expired, so "
+                "the request was recognised by tenant-scoped client identity "
+                "instead. The body is the resource's CURRENT state, not the "
+                "original stored response, and nothing was created."
+            ),
+            "headers": {
+                "Idempotent-Replay": {
+                    "description": "`true`. Always present on any replay.",
+                    "schema": {"type": "string", "enum": ["true"]},
+                },
+                "Idempotent-Replay-Source": {
+                    "description": (
+                        "`resource` — recognised by client identity after the stored "
+                        "result expired. Absent on a retained-result replay, which "
+                        "returns 201 with the original bytes."
+                    ),
+                    "schema": {"type": "string", "enum": ["resource"]},
+                },
+            },
+        }
+    }

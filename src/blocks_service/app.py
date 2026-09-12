@@ -214,6 +214,12 @@ def _finalise_openapi(app: FastAPI, settings: Settings) -> None:
         for union_path in (
             "/v1/tenants/{tenant_id}/sessions",
             "/v1/tenants/{tenant_id}/sessions/{session_id}/close",
+            # Block registration is the same shape of promise: the 0.4
+            # server-minted form and the ADR-0014 client-supplied form are a
+            # closed choice, never a merge. `anyOf` would let a generator offer a
+            # body carrying a client_id under the 120-character legacy limit,
+            # which no handler accepts.
+            "/v1/tenants/{tenant_id}/blocks",
         ):
             operation = schema["paths"].get(union_path, {}).get("post")
             if not operation:
@@ -221,6 +227,14 @@ def _finalise_openapi(app: FastAPI, settings: Settings) -> None:
             body = operation.get("requestBody", {}).get("content", {}).get("application/json", {})
             if "anyOf" in (body.get("schema") or {}):
                 body["schema"]["oneOf"] = body["schema"].pop("anyOf")
+            # The two results are a closed choice too: which one arrives is
+            # decided by which form was sent, and only one can be right.
+            for code, response in operation.get("responses", {}).items():
+                if not code.startswith("2"):
+                    continue
+                rs = response.get("content", {}).get("application/json", {}).get("schema") or {}
+                if "anyOf" in rs:
+                    rs["oneOf"] = rs.pop("anyOf")
 
         # Idempotent replays are indistinguishable from first responses without
         # this header, and a client that cannot tell cannot report accurately.

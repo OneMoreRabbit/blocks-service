@@ -44,3 +44,56 @@ alter table blocks.physical_blocks
 
 alter table blocks.physical_blocks
   validate constraint physical_blocks_client_identity_complete;
+
+-- ---------------------------------------------------------------------------
+-- Tenant-composite referential integrity for bindings
+-- ---------------------------------------------------------------------------
+--
+-- `block_bindings.block_id` and `.project_id` reference globally keyed parents.
+-- Row-level security checks the CHILD's tenant_id and cannot see which tenant the
+-- parent belongs to, so a guessed UUID from another tenant satisfies the foreign
+-- key while the child row claims the caller's tenant. That is cross-tenant
+-- referential corruption, and — through the global one-current-binding index —
+-- a way to end a binding in a tenant the caller cannot read.
+--
+-- The application now proves both parents are visible before writing. This is the
+-- half that holds when application validation is bypassed: the composite keys
+-- make "same tenant" part of the reference itself, so the database cannot store
+-- the corrupt shape at all.
+
+-- `projects` already carries `projects_tenant_id_key` from 0007, which introduced
+-- exactly this pattern for the project-model tables. Bindings are simply the
+-- table it never reached, so this is completing an established invariant rather
+-- than inventing one.
+alter table blocks.physical_blocks
+  add constraint physical_blocks_tenant_id_key unique (tenant_id, id);
+
+alter table blocks.block_bindings
+  add constraint block_bindings_block_in_tenant
+  foreign key (tenant_id, block_id)
+  references blocks.physical_blocks (tenant_id, id) on delete cascade
+  not valid;
+
+alter table blocks.block_bindings
+  add constraint block_bindings_project_in_tenant
+  foreign key (tenant_id, project_id)
+  references blocks.projects (tenant_id, id) on delete cascade
+  not valid;
+
+-- Validation reads every existing binding and both parent tables. Forced RLS
+-- applies to the owner too, so under FORCE the scan sees nothing and the
+-- constraint would be marked valid without having checked a single row --
+-- "validated" against an empty view. FORCE is lifted for the scan, inside this
+-- transaction, and restored before commit. A test asserts the restoration,
+-- because a migration that leaves FORCE off is a silent, total loss of tenant
+-- isolation.
+alter table blocks.block_bindings   no force row level security;
+alter table blocks.physical_blocks  no force row level security;
+alter table blocks.projects         no force row level security;
+
+alter table blocks.block_bindings validate constraint block_bindings_block_in_tenant;
+alter table blocks.block_bindings validate constraint block_bindings_project_in_tenant;
+
+alter table blocks.block_bindings   force row level security;
+alter table blocks.physical_blocks  force row level security;
+alter table blocks.projects         force row level security;

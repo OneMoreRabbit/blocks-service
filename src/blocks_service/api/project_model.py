@@ -17,39 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .. import errors, project_model as pm
 from ..idempotency import Idempotency
-from .deps import TenantContext, as_http, idempotency, if_match_version, tenant_context
+from .deps import replay_responses, TenantContext, as_http, idempotency, if_match_version, tenant_context
 
 #: The `200` a resource replay returns, declared so a generated client never has
 #: to infer it. The distinction from `201` is real: `201` carries the ORIGINAL
 #: STORED BYTES of the first response, while `200` carries the resource's CURRENT
 #: state, which may have been renamed or superseded since it was created.
-def _replay_responses(model: str) -> dict:
-    return {
-        200: {
-            "description": (
-                "Resource replay. The ordinary idempotency result had expired, so "
-                "the request was recognised by tenant-scoped client identity "
-                "instead. The body is the resource's CURRENT state, not the "
-                "original stored response, and nothing was created."
-            ),
-            "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{model}"}}},
-            "headers": {
-                "Idempotent-Replay": {
-                    "description": "`true`. Always present on any replay.",
-                    "schema": {"type": "string", "enum": ["true"]},
-                },
-                "Idempotent-Replay-Source": {
-                    "description": (
-                        "`resource` — recognised by client identity after the stored "
-                        "result expired. Absent on a retained-result replay, which "
-                        "returns 201 with the original bytes."
-                    ),
-                    "schema": {"type": "string", "enum": ["resource"]},
-                },
-            },
-        }
-    }
-
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/projects", tags=["projects"])
 
 
@@ -225,7 +198,7 @@ async def list_projects(
     response_model=ProjectOut,
     responses={
         **errors.error_responses(400, 401, 403, 409, 426),
-        **_replay_responses("ProjectOut"),
+        **replay_responses(ProjectOut),
     },
     summary="Create a project",
     description=(
@@ -406,7 +379,7 @@ async def save_notes(
     response_model=ProjectParkingOut,
     responses={
         **errors.error_responses(400, 401, 403, 404, 409, 426),
-        **_replay_responses("ProjectParkingOut"),
+        **replay_responses(ProjectParkingOut),
     },
     summary="Add a park message",
     description=(

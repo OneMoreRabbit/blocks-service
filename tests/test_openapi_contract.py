@@ -231,3 +231,43 @@ def test_the_reentry_result_is_required_and_nullable(spec):
         assert any(
             option.get("type") == "null" for option in reentry["properties"][field]["anyOf"]
         ), field
+
+
+def test_block_registration_publishes_its_two_forms_and_its_replay(spec):
+    """The contract-visible behaviour a generated client cannot infer privately.
+
+    Architecture's 0.5 review blocked on exactly this: the handler returned a
+    resource replay the document did not declare, so an Android generator could
+    only reach the prose contract by guessing.
+    """
+    op = spec["paths"]["/v1/tenants/{tenant_id}/blocks"]["post"]
+
+    body = op["requestBody"]["content"]["application/json"]["schema"]
+    assert "oneOf" in body and "anyOf" not in body, (
+        "the two registration forms are a closed choice, never a merge"
+    )
+    assert len(body["oneOf"]) == 2
+
+    created = op["responses"]["201"]["content"]["application/json"]["schema"]
+    assert "oneOf" in created and "anyOf" not in created
+
+    replay = op["responses"]["200"]
+    assert replay["content"]["application/json"]["schema"]["$ref"].endswith("ReplayedBlockOut")
+    assert set(replay["headers"]) >= {"Idempotent-Replay", "Idempotent-Replay-Source"}
+    assert replay["headers"]["Idempotent-Replay-Source"]["schema"]["enum"] == ["resource"]
+
+
+def test_the_client_form_never_publishes_a_token_in_a_result(spec):
+    """Search the published models, not the prose."""
+    schemas = spec["components"]["schemas"]
+    assert "tag_token" not in schemas["ClientRegisteredBlockOut"]["properties"]
+    assert "tag_token" not in schemas["ReplayedBlockOut"]["properties"]
+    assert "tag_token" in schemas["RegisteredBlockOut"]["properties"], (
+        "the 0.4 server-minted form keeps its one-time result"
+    )
+
+
+def test_the_local_first_label_length_is_honest(spec):
+    schemas = spec["components"]["schemas"]
+    assert schemas["ClientBlockIn"]["properties"]["label"]["maxLength"] == 200
+    assert schemas["LegacyBlockIn"]["properties"]["label"]["maxLength"] == 120
