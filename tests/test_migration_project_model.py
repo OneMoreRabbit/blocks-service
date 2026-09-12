@@ -19,12 +19,14 @@ from psycopg.rows import dict_row
 
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
-EXPAND = [m for m in MIGRATIONS if m.stem.startswith(("0007", "0008", "0009", "0010", "0011"))]
+EXPAND = [m for m in MIGRATIONS
+          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012"))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
 SCOPED = EXPAND[3]        # 0010 — tenant-scoped client identity
 RESERVE = EXPAND[4]       # 0011 — idempotency reservation
+BLOCKID = EXPAND[5]       # 0012 — client-generated block identity
 SCRATCH = "blocks_migration_drill"
 
 
@@ -122,7 +124,7 @@ def _apply(dbname: str, migration: pathlib.Path) -> None:
 
 
 def _migrate(dbname: str) -> None:
-    """The whole expand step, as it deploys: 0007 through 0010."""
+    """The whole expand step, as it deploys: 0007 through 0012."""
     for migration in EXPAND:
         _apply(dbname, migration)
 
@@ -472,7 +474,8 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
     _apply(legacy_db, INVARIANT)                    # 0008 heals it
     _apply(legacy_db, IDENTITY)                     # 0009
     _apply(legacy_db, SCOPED)                       # 0010
-    _apply(legacy_db, RESERVE)                      # 0011 completes the expand step
+    _apply(legacy_db, RESERVE)                      # 0011
+    _apply(legacy_db, BLOCKID)                      # 0012 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
@@ -638,6 +641,7 @@ def test_0010_upgrades_a_database_holding_eligible_0009_era_rows(legacy_db):
 
     _apply(legacy_db, SCOPED)       # 0010 — must survive this
     _apply(legacy_db, RESERVE)      # 0011
+    _apply(legacy_db, BLOCKID)      # 0012
 
     with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
         conn.execute("set role blocks_owner")
@@ -668,9 +672,150 @@ def test_0010_upgrades_a_database_holding_eligible_0009_era_rows(legacy_db):
         idx = {r["indexname"] for r in conn.execute(
             "select indexname from pg_indexes where schemaname='blocks'"
             " and indexname like '%tenant_client_id_key'").fetchall()}
-        assert len(idx) == 2, idx
+        # Three tables carry tenant-scoped client identity after the full expand:
+        # projects and parking_records from 0010, physical_blocks from 0012. The
+        # count is asserted rather than the mere presence of any one of them, so
+        # a table that quietly acquires or loses the pattern is visible here.
+        assert idx == {
+            "projects_tenant_client_id_key",
+            "parking_records_tenant_client_id_key",
+            "physical_blocks_tenant_client_id_key",
+        }, idx
         forced = conn.execute(
             "select bool_and(relforcerowsecurity) as f from pg_class"
             " where relnamespace='blocks'::regnamespace and relkind='r'"
             "   and relname in ('projects','parking_records')").fetchone()["f"]
         assert forced, "forced RLS must be restored"
+
+
+# --------------------------------------------------------------------------
+# 0012 — client-generated block identity (ADR-0014)
+# --------------------------------------------------------------------------
+
+
+def _new_tenant(dbname: str, name: str) -> str:
+    with psycopg.connect(_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        return conn.execute(
+            "insert into blocks.tenants (kind, name)"
+            " values ('organization', %s) returning id::text as id",
+            (name,),
+        ).fetchone()["id"]
+
+
+def _insert_block(dbname: str, tenant: str, label: str, token_hash: bytes):
+    """Insert a block the way the runtime does: under transaction-local context.
+
+    Forced row-level security applies to `blocks_owner` too, so a bare insert as
+    the owner is refused. Setting the context is not a workaround -- it is the
+    only legal way to write a tenant-scoped row, which is the property 0004 was
+    written to guarantee.
+    """
+    with psycopg.connect(_dsn(dbname), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        row = conn.execute(
+            "insert into blocks.physical_blocks (tenant_id, label, token_hash)"
+            " values (%s, %s, %s) returning id::text as id",
+            (tenant, label, token_hash),
+        ).fetchone()
+        conn.commit()
+        return row
+
+
+def _tenant_and_block(dbname: str, label: str, token_hash: bytes) -> tuple[str, str]:
+    """A 0.4-era block: server-minted token, no client identity."""
+    with psycopg.connect(_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        tenant = conn.execute(
+            "insert into blocks.tenants (kind, name) values ('organization', %s)"
+            " returning id::text as id",
+            (label + " tenant",),
+        ).fetchone()["id"]
+    block = _insert_block(dbname, tenant, label, token_hash)["id"]
+    return tenant, block
+
+
+def test_0012_upgrades_a_database_holding_0_4_era_blocks(legacy_db):
+    """A server-generated block has no truthful client identity and gets none.
+
+    The migration must not invent one. A fabricated `client_id` would assert that
+    some client named this row, and a later genuine registration carrying that
+    value would then replay a block it never created.
+    """
+    for migration in EXPAND[:5]:                      # through 0011
+        _apply(legacy_db, migration)
+    shared = b"\x11" * 32
+    tenant, _ = _tenant_and_block(legacy_db, "Legacy", shared)
+
+    _apply(legacy_db, BLOCKID)                        # 0012 — must survive this
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, false)", (tenant,))
+        row = conn.execute(
+            "select client_id, creation_fingerprint, label from blocks.physical_blocks"
+        ).fetchone()
+        assert row["client_id"] is None, "no fabricated client identity"
+        assert row["creation_fingerprint"] is None, "and therefore no fingerprint"
+        assert row["label"] == "Legacy", "the row is otherwise untouched"
+
+        validated = conn.execute(
+            "select convalidated as v from pg_constraint"
+            " where conrelid = ('blocks.physical_blocks')::regclass"
+            "   and conname = 'physical_blocks_client_identity_complete'"
+        ).fetchone()["v"]
+        assert validated, "the identity-completeness constraint ends up VALIDATED"
+
+
+def test_0012_makes_token_uniqueness_tenant_scoped(legacy_db):
+    """The 0.4 global index is an oracle once clients supply the token.
+
+    Two tenants may legitimately hold the same 32 bytes. Before 0012 the second
+    insert failed, and the failure alone disclosed that the value existed
+    somewhere the caller could not see.
+    """
+    for migration in EXPAND[:5]:
+        _apply(legacy_db, migration)
+    shared = b"\x22" * 32
+    _tenant_and_block(legacy_db, "First", shared)
+    second = _new_tenant(legacy_db, "second")
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        _insert_block(legacy_db, second, "Clash", shared)
+
+    _apply(legacy_db, BLOCKID)
+
+    third = _new_tenant(legacy_db, "third")
+    _insert_block(legacy_db, third, "Independent", shared)
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.physical_blocks no force row level security")
+        n = conn.execute(
+            "select count(*) as n from blocks.physical_blocks where token_hash = %s",
+            (shared,),
+        ).fetchone()["n"]
+        conn.execute("alter table blocks.physical_blocks force row level security")
+    assert n == 2, "the same token in two tenants is two independent blocks"
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        _insert_block(legacy_db, third, "Duplicate", shared)
+
+
+def test_a_0_4_writer_still_works_against_the_0012_schema(legacy_db):
+    """Restore/rollback boundary: the older image writes neither new column."""
+    _migrate(legacy_db)
+    tenant = _new_tenant(legacy_db, "rollback")
+    block = _insert_block(legacy_db, tenant, "Old writer", b"\x33" * 32)["id"]
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        row = conn.execute(
+            "select client_id, creation_fingerprint from blocks.physical_blocks"
+            " where id = %s", (block,)
+        ).fetchone()
+    assert row["client_id"] is None and row["creation_fingerprint"] is None, (
+        "the 0.4 insert shape is still legal and still satisfies the constraint"
+    )

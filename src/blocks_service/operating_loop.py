@@ -18,6 +18,8 @@ same session are resolved.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import secrets
 from dataclasses import dataclass
@@ -64,6 +66,17 @@ class ActiveSessionExists(DomainError):
     """One active session per user: park or close the current one first."""
 
 
+class BlockIdentityConflict(ConcurrencyConflict):
+    """A client block identity or tag token is already used differently here.
+
+    Deliberately one error for two causes -- a reused `client_id` under a
+    different operation, and a token already assigned to another block in this
+    tenant. The caller learns that *this* registration cannot proceed and nothing
+    about which of its values was the problem, because saying which would answer a
+    question the caller may not be entitled to ask.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Physical blocks and bindings
 # ---------------------------------------------------------------------------
@@ -86,19 +99,176 @@ def hash_token(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
 
 
+#: 32 random bytes as unpadded base64url -- exactly 43 characters (ADR-0014).
+#: The tag carries `blocks://tag/v1/<token>`; the token alone reaches this service.
+CANONICAL_TOKEN_BYTES = 32
+CANONICAL_TOKEN_CHARS = 43
+
+
+class MalformedToken(DomainError):
+    """The supplied token is not the canonical ADR-0014 encoding."""
+
+
+def canonical_token_bytes(token: str) -> bytes:
+    """Decode a client-supplied token, or refuse it.
+
+    Validation is exact rather than lenient. A token that decodes to the right
+    length under padded base64, or with standard `+/` alphabet, is *not* the
+    canonical form, and accepting it would let two spellings of one secret become
+    two different hashes -- so the same physical tag would register twice and
+    resolve as two blocks. Re-encoding the decoded bytes and requiring the result
+    to equal the input is what makes the encoding canonical rather than merely
+    decodable.
+    """
+    if len(token) != CANONICAL_TOKEN_CHARS:
+        raise MalformedToken(
+            f"tag_token must be {CANONICAL_TOKEN_CHARS} characters of unpadded base64url"
+        )
+    try:
+        raw = base64.urlsafe_b64decode(token + "=")
+    except (binascii.Error, ValueError) as exc:
+        raise MalformedToken("tag_token is not valid unpadded base64url") from exc
+    if len(raw) != CANONICAL_TOKEN_BYTES:
+        raise MalformedToken(
+            f"tag_token must decode to {CANONICAL_TOKEN_BYTES} bytes"
+        )
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != token:
+        raise MalformedToken("tag_token is not in canonical unpadded base64url form")
+    return raw
+
+
+def block_creation_fingerprint(
+    client_id: UUID, label: str, token_hash: bytes
+) -> bytes:
+    """Durable creation identity for a client-registered block.
+
+    Over the client identity, the label and the token HASH -- never the raw token,
+    so the fingerprint is safe to retain beside the row it identifies. Replay
+    correctness therefore outlives idempotency-result retention, which ADR-0014
+    requires because an offline phone may return long after the result expires.
+    """
+    h = hashlib.sha256()
+    h.update(str(client_id).encode())
+    h.update(b"\x00")
+    h.update(label.encode())
+    h.update(b"\x00")
+    h.update(token_hash)
+    return h.digest()
+
+
+def _violated(exc: psycopg.errors.UniqueViolation) -> str:
+    """The constraint a unique violation actually names."""
+    return getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+
+
+BLOCK_COLUMNS = "id, label, state::text as state"
+
+
 async def register_block(
-    conn: psycopg.AsyncConnection, tenant_id: UUID, label: str
-) -> tuple[Block, str]:
-    """Create a block and mint its tag token. The plaintext is returned once."""
-    token = secrets.token_urlsafe(32)
-    cur = await conn.execute(
-        "insert into blocks.physical_blocks (tenant_id, label, token_hash)"
-        " values (%s, %s, %s) returning id, label, state::text as state",
-        (tenant_id, label, hash_token(token)),
-    )
+    conn: psycopg.AsyncConnection,
+    tenant_id: UUID,
+    label: str,
+    *,
+    client_id: UUID | None = None,
+    token: str | None = None,
+) -> tuple[Block, str, bool]:
+    """Register a block. Returns (block, token, replayed).
+
+    Two shapes, and the caller chooses by supplying both client values or neither:
+
+      neither  -- the API 0.4 flow. The service mints the token and returns it once.
+      both     -- the ADR-0014 local-first flow. The phone already programmed the
+                  tag offline; the token it wrote is the only one that can work, so
+                  the service accepts it rather than issuing a competing value.
+
+    Identity is TENANT-SCOPED, for the reason ADR-0011 established and ADR-0014
+    inherits: every uniqueness check runs under this tenant's policy, so a value
+    another tenant holds is never consulted and there is nothing to probe. The
+    same raw token in two tenants is two independent blocks.
+
+    The retained fingerprint separates the two cases that look identical from
+    inside the tenant -- same identity same operation is a replay, same identity
+    different label or token is a conflict -- without depending on the idempotency
+    result still existing.
+    """
+    if (client_id is None) != (token is None):
+        raise MalformedToken(
+            "client_id and tag_token are supplied together or both omitted"
+        )
+
+    if client_id is None:
+        minted = secrets.token_urlsafe(CANONICAL_TOKEN_BYTES)
+        cur = await conn.execute(
+            "insert into blocks.physical_blocks (tenant_id, label, token_hash)"
+            f" values (%s, %s, %s) returning {BLOCK_COLUMNS}",
+            (tenant_id, label, hash_token(minted)),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        return Block(**row), minted, False
+
+    assert token is not None
+    canonical_token_bytes(token)          # refuse a non-canonical spelling first
+    token_hash = hash_token(token)
+    fingerprint = block_creation_fingerprint(client_id, label, token_hash)
+
+    existing = await _block_by_client_id(conn, client_id)
+    if existing is not None:
+        return _replay_or_conflict(existing, fingerprint), token, True
+
+    try:
+        async with conn.transaction():    # savepoint: a lost race must not abort us
+            cur = await conn.execute(
+                "insert into blocks.physical_blocks"
+                " (tenant_id, label, token_hash, client_id, creation_fingerprint)"
+                f" values (%s, %s, %s, %s, %s) returning {BLOCK_COLUMNS}",
+                (tenant_id, label, token_hash, client_id, fingerprint),
+            )
+    except psycopg.errors.UniqueViolation as exc:
+        # Losing the insert is a question, not an answer. A simultaneous retry of
+        # the SAME operation must converge to a replay; answering 409 would tell a
+        # client its own retry conflicted with itself.
+        constraint = _violated(exc)
+        if constraint == "physical_blocks_tenant_client_id_key":
+            winner = await _block_by_client_id(conn, client_id)
+            if winner is None:
+                raise
+            return _replay_or_conflict(winner, fingerprint), token, True
+        if constraint == "physical_blocks_tenant_token_hash_key":
+            # This token already belongs to a different block in this tenant. Same
+            # conflict shape as any other registration conflict -- the caller is
+            # not told which of its two values collided.
+            raise BlockIdentityConflict(
+                "that registration cannot be completed in this tenant; "
+                "reconcile against the existing block"
+            ) from exc
+        raise
+
     row = await cur.fetchone()
     assert row is not None
-    return Block(**row), token
+    return Block(**row), token, False
+
+
+async def _block_by_client_id(
+    conn: psycopg.AsyncConnection, client_id: UUID
+) -> dict | None:
+    cur = await conn.execute(
+        f"select {BLOCK_COLUMNS}, creation_fingerprint from blocks.physical_blocks"
+        " where client_id = %s",
+        (client_id,),
+    )
+    return await cur.fetchone()
+
+
+def _replay_or_conflict(existing: dict, fingerprint: bytes) -> Block:
+    row = dict(existing)
+    stored = row.pop("creation_fingerprint", None)
+    if stored is None or bytes(stored) != fingerprint:
+        raise BlockIdentityConflict(
+            "that client_id is already used in this tenant by a different "
+            "registration; reconcile against the existing block"
+        )
+    return Block(**row)
 
 
 async def list_blocks(conn: psycopg.AsyncConnection) -> list[dict]:

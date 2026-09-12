@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     dev_token_secret: str = "blocks-dev-insecure-signing-key-do-not-deploy"
 
     api_title: str = "Blocks Service API"
-    api_version: str = "0.4.0"
+    api_version: str = "0.5.0"
 
     #: Clients below this are refused with 426 upgrade_required. A client that
     #: sends no version header is allowed through: the header is additive and

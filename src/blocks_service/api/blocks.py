@@ -6,7 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .. import errors, operating_loop as loop
 from ..idempotency import Idempotency
@@ -16,7 +16,41 @@ router = APIRouter(prefix="/v1/tenants/{tenant_id}/blocks", tags=["blocks"])
 
 
 class BlockIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     label: str = Field(min_length=1, max_length=120)
+    client_id: UUID | None = Field(
+        default=None,
+        description=(
+            "**Optional client identifier, unique within your tenant.** A local-first "
+            "client mints this before it programs the tag and always supplies it, so a "
+            "registration replayed after any offline period cannot duplicate. It is "
+            "**not** the canonical id: Service still generates that and returns both. "
+            "Supplied together with `tag_token` or not at all. Two tenants may use the "
+            "same value for unrelated blocks, and neither can learn anything about the "
+            "other. Omit both to keep API 0.4 behaviour."
+        ),
+    )
+    tag_token: str | None = Field(
+        default=None,
+        description=(
+            "**Optional client-generated tag token**, exactly the canonical "
+            "ADR-0014 value: 32 random bytes as 43 characters of unpadded base64url. "
+            "Send the token only -- never the whole `blocks://tag/v1/<token>` URI. "
+            "Supply it when the tag was already programmed offline, so the value "
+            "physically written to the tag is the one Service records. Service stores "
+            "only its hash and echoes the token back solely in this registration's own "
+            "result. Supplied together with `client_id` or not at all."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _identity_is_all_or_nothing(self) -> "BlockIn":
+        # Half an identity cannot replay and cannot conflict. Refusing it here
+        # makes the contract state the rule; the 0012 check constraint makes the
+        # database refuse to hold the state at all.
+        if (self.client_id is None) != (self.tag_token is None):
+            raise ValueError("client_id and tag_token are supplied together or both omitted")
+        return self
 
 
 class BlockOut(BaseModel):
@@ -27,12 +61,52 @@ class BlockOut(BaseModel):
 
 
 class RegisteredBlockOut(BlockOut):
+    client_id: UUID | None = Field(
+        default=None,
+        description="Echoed when you supplied one, so a client can attribute this result.",
+    )
     tag_token: str = Field(
         description=(
-            "The token to write to the NFC tag. Returned ONCE, at registration; "
-            "the service stores only its hash and cannot show it again."
+            "The token for the NFC tag. Returned ONCE, in this registration's own "
+            "result; the service stores only its hash and cannot show it again. When "
+            "you supplied the token, this is that same value echoed back -- Service "
+            "never replaces a token a tag already carries."
         )
     )
+
+
+class ReplayedBlockOut(BlockOut):
+    """A registration recognised by resource identity after the result expired.
+
+    No `tag_token`. The client that supplied one already has it, and a resource
+    replay is a read of current state rather than the original result -- Service
+    could only reconstruct the token by storing it, which it deliberately does not.
+    """
+
+    client_id: UUID | None = None
+
+
+class _ResourceReplay(Exception):
+    """A registration recognised by RESOURCE identity, not by a stored result.
+
+    `200` rather than `201`: nothing was created by this request. Distinguished
+    from an ordinary idempotent replay because that one returns the original bytes
+    and this one can only return current state.
+    """
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    @property
+    def body(self) -> dict:
+        return self._body
+
+    def response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=self._body,
+            headers={"Idempotent-Replay": "true", "Idempotent-Replay-Source": "resource"},
+        )
 
 
 class BindIn(BaseModel):
@@ -70,12 +144,41 @@ async def register(
     idem: Idempotency = Depends(idempotency),
 ) -> JSONResponse:
     async def produce() -> dict:
-        block, token = await loop.register_block(ctx.conn, ctx.tenant_id, body.label)
+        try:
+            block, token, replayed = await loop.register_block(
+                ctx.conn,
+                ctx.tenant_id,
+                body.label,
+                client_id=body.client_id,
+                token=body.tag_token,
+            )
+        except loop.DomainError as exc:
+            raise as_http(exc) from exc
+        if replayed:
+            raise _ResourceReplay(
+                ReplayedBlockOut(
+                    id=block.id,
+                    label=block.label,
+                    state=block.state,
+                    client_id=body.client_id,
+                ).model_dump(mode="json")
+            )
         return RegisteredBlockOut(
-            id=block.id, label=block.label, state=block.state, tag_token=token
+            id=block.id,
+            label=block.label,
+            state=block.state,
+            client_id=body.client_id,
+            tag_token=token,
         ).model_dump(mode="json")
 
-    return await idem.run(status.HTTP_201_CREATED, produce)
+    try:
+        return await idem.run(status.HTTP_201_CREATED, produce)
+    except _ResourceReplay as replay:
+        # This request holds the key reservation and is finishing without going
+        # back through run(), so it records its own outcome -- otherwise the
+        # reservation commits with no result and the next retry cannot replay it.
+        await idem.complete(status.HTTP_200_OK, replay.body)
+        return replay.response()
 
 
 @router.get(

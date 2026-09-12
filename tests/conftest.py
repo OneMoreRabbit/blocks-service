@@ -181,3 +181,51 @@ def auth(token) -> "callable":
         return {"Authorization": f"Bearer {token(subject, email)}"}
 
     return headers
+
+
+@pytest.fixture
+def contested(monkeypatch):
+    """Hold every caller at the exact contested point: the missing-key read.
+
+    `asyncio.gather` alone proves nothing here: the event loop is free to run one
+    request to completion before starting the other, and a sequential schedule
+    makes the second request read a stored result through the ordinary path.
+
+    Nor is it enough to hold callers at the entry to `Idempotency.run` — they
+    could still serialise across the key lookup, so the test would not have shown
+    that both of them saw no result. The defect lives in the window that opens
+    when the lookup returns nothing and closes when the reservation is inserted,
+    so the barrier belongs inside that window and nowhere else.
+
+    The interception is therefore on `_read`, and only on a read that found
+    nothing. `arrived` counts callers that have seen no result, and none of them
+    is released until all of them have: when a caller returns from `_read`, every
+    participant is provably past the missing-key decision and none has attempted
+    its insert. Patched test-side, so no production seam exists for it.
+
+    The losing side of a unique violation re-reads and finds the winner's row.
+    That is not a missing-key read, so it never touches the barrier.
+    """
+    import asyncio
+
+    from blocks_service.idempotency import Idempotency
+
+    original = Idempotency._read
+
+    def arm(participants: int):
+        gate = asyncio.Event()
+        arrived = []
+
+        async def barriered(self):
+            stored = await original(self)
+            if stored is None:
+                arrived.append(1)
+                if len(arrived) >= participants:
+                    gate.set()
+                await asyncio.wait_for(gate.wait(), timeout=10)
+            return stored
+
+        monkeypatch.setattr(Idempotency, "_read", barriered)
+        return arrived
+
+    return arm
