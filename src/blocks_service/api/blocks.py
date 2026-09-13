@@ -21,11 +21,25 @@ from .deps import (
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/blocks", tags=["blocks"])
 
 
+#: A label must contain something. `min_length` alone counts characters, so "   "
+#: passed request validation and died on the database's
+#: `physical_blocks_label_not_blank` check -- outside the domain-error mapping,
+#: so the caller got an internal error instead of the declared 400. The pattern is
+#: unanchored on purpose: JSON Schema `pattern` is a search, so `\S` reads as
+#: "contains at least one non-whitespace character" to a generator as well.
+NON_BLANK = r"\S"
+
+
 class LegacyBlockIn(BaseModel):
     """API 0.4 form: Service mints the token and returns it once."""
 
     model_config = ConfigDict(extra="forbid")
-    label: str = Field(min_length=1, max_length=120)
+    label: str = Field(
+        min_length=1,
+        max_length=120,
+        pattern=NON_BLANK,
+        description="Non-blank, up to 120 characters. Whitespace alone is not a label.",
+    )
 
 
 class ClientBlockIn(BaseModel):
@@ -41,9 +55,11 @@ class ClientBlockIn(BaseModel):
     label: str = Field(
         min_length=1,
         max_length=200,
+        pattern=NON_BLANK,
         description=(
             "Non-blank, up to 200 characters — the length Android's local model "
-            "already accepts. The 0.4 server-minted form keeps its 120-character limit."
+            "already accepts. Whitespace alone is not a label. The 0.4 server-minted "
+            "form keeps its 120-character limit."
         ),
     )
     client_id: UUID = Field(

@@ -264,10 +264,16 @@ async def test_the_same_client_id_in_another_tenant_is_independent(client, auth)
 # --------------------------------------------------------------------------
 
 
-async def test_the_raw_token_is_nowhere_but_the_registration_result(
+async def test_a_client_supplied_token_is_nowhere_at_all(
     client, auth, db: Database
 ):
-    """Storage, events and reads. The hash is the only durable form."""
+    """Storage, events and reads — and no result either.
+
+    The name matters: an earlier version said "nowhere but the registration
+    result", which described the draft that echoed the token. A client-supplied
+    token now exists only in the request that carried it. The hash is the only
+    durable form.
+    """
     tenant = await _tenant(client, auth)
     actor = await _actor(client, auth)
     token = canonical_token()
@@ -626,3 +632,129 @@ async def test_a_200_character_label_is_accepted_on_the_client_form(client, auth
 
     assert ok.status_code == 201, "the local-first form takes the length Android sends"
     assert legacy.status_code == 400, "the server-minted form keeps its 0.4 limit"
+
+
+# --------------------------------------------------------------------------
+# A label must contain something
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n", " \t\n "])
+@pytest.mark.parametrize("form", ["legacy", "client"])
+async def test_a_blank_label_is_refused_at_the_edge(client, auth, blank, form):
+    """`min_length` counts characters; a label has to contain something.
+
+    Whitespace alone used to pass request validation and die on the database's
+    `physical_blocks_label_not_blank` check — outside the domain-error mapping,
+    so the caller got an internal error instead of the declared 400.
+    """
+    tenant = await _tenant(client, auth)
+    body = {"label": blank}
+    if form == "client":
+        body |= {"client_id": str(uuid.uuid4()), "tag_token": canonical_token()}
+
+    r = await _register(client, auth, tenant, **body)
+
+    assert r.status_code == 400, f"{form}: {blank!r}"
+    assert r.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "form, length, ok",
+    [("legacy", 120, True), ("legacy", 121, False),
+     ("client", 200, True), ("client", 201, False)],
+)
+async def test_each_form_keeps_its_own_length_boundary(client, auth, form, length, ok):
+    tenant = await _tenant(client, auth)
+    body = {"label": "x" * length}
+    if form == "client":
+        body |= {"client_id": str(uuid.uuid4()), "tag_token": canonical_token()}
+
+    r = await _register(client, auth, tenant, **body)
+    assert (r.status_code == 201) is ok, f"{form} at {length}"
+
+
+async def test_a_label_of_one_visible_character_is_fine(client, auth):
+    """Non-blank is the rule, not 'long enough'."""
+    tenant = await _tenant(client, auth)
+    r = await _register(client, auth, tenant, label="x")
+    assert r.status_code == 201
+
+
+# --------------------------------------------------------------------------
+# The supplied token is never echoed, on any surface
+# --------------------------------------------------------------------------
+
+
+async def test_no_client_surface_ever_echoes_the_supplied_token(client, auth):
+    """First result, conflicts, and validation failures alike."""
+    tenant = await _tenant(client, auth)
+    token = canonical_token()
+    path = f"/v1/tenants/{tenant}/blocks"
+
+    first = await client.post(path, headers=auth("alice"), json={
+        "label": "Workbench", "client_id": str(uuid.uuid4()), "tag_token": token})
+    assert first.status_code == 201
+    assert token not in first.text, "not in the first client result"
+
+    collision = await client.post(path, headers=auth("alice"), json={
+        "label": "Other", "client_id": str(uuid.uuid4()), "tag_token": token})
+    assert collision.status_code == 409
+    assert token not in collision.text, "not in a token-collision conflict"
+
+    cid = first.json()["client_id"]
+    reused = await client.post(path, headers=auth("alice"), json={
+        "label": "Renamed", "client_id": cid, "tag_token": canonical_token()})
+    assert reused.status_code == 409
+    assert token not in reused.text, "not in an identity conflict"
+
+    malformed = await client.post(path, headers=auth("alice"), json={
+        "label": "Workbench", "client_id": str(uuid.uuid4()), "tag_token": token + "x"})
+    assert malformed.status_code == 400
+    assert token not in malformed.text, "not echoed back by a validation failure"
+
+
+# --------------------------------------------------------------------------
+# The observability boundary
+# --------------------------------------------------------------------------
+
+
+def test_the_runtime_exposes_no_request_body_metric_surface():
+    """A token cannot leak through a metric that does not exist.
+
+    Asserted rather than assumed: "we do not have metrics" is the kind of claim
+    that quietly stops being true, and the first metric to arrive is exactly the
+    one someone will label with request content.
+    """
+    import pathlib
+
+    src = pathlib.Path("src/blocks_service")
+    offenders = [
+        p.name for p in src.rglob("*.py")
+        if any(k in p.read_text() for k in ("prometheus", "statsd", "start_http_server"))
+    ]
+    assert not offenders, f"a metric surface appeared in {offenders}; re-check this boundary"
+
+
+def test_dispatcher_logging_is_an_allowlist_of_envelope_metadata():
+    """The sink sees named envelope fields, never a payload."""
+    from blocks_service.dispatcher import LOGGABLE_ENVELOPE_FIELDS, loggable
+
+    envelope = {
+        "eventId": "e1",
+        "eventType": "block.bound",
+        "eventVersion": 1,
+        "tenantId": "t1",
+        "occurredAt": "2026-09-13T00:00:00Z",
+        "payload": {"tagToken": "a-raw-token-that-must-never-be-logged"},
+        "somethingAddedLater": "also not logged",
+    }
+
+    logged = loggable(envelope)
+
+    assert set(logged) <= set(LOGGABLE_ENVELOPE_FIELDS)
+    assert "payload" not in logged
+    assert "somethingAddedLater" not in logged, (
+        "an allowlist, not a denylist: a field added later is excluded by default"
+    )
+    assert "a-raw-token-that-must-never-be-logged" not in str(logged)

@@ -154,9 +154,12 @@ def if_match_version(
 def as_http(exc: DomainError) -> errors.ApiError:
     """Map a domain rule to the contract's error codes.
 
-    `NotFound` becomes 403, not 404: inside a tenant the caller belongs to, a
-    missing row and a row in another tenant are indistinguishable *by design* --
-    RLS returns nothing for both -- so reporting 404 would leak the difference.
+    `NotFound` becomes **404 not_found**, and the reason is the same one an earlier
+    version of this docstring gave for 403: inside a tenant the caller belongs to,
+    a missing row and a row in another tenant are indistinguishable *by design* --
+    row-level security returns nothing for both. What matters is that the two
+    cases answer IDENTICALLY, not which code they share, and 404 is the code the
+    contract declares.
     """
     if isinstance(exc, NotFound):
         return errors.not_found(str(exc))

@@ -819,3 +819,97 @@ def test_a_0_4_writer_still_works_against_the_0012_schema(legacy_db):
     assert row["client_id"] is None and row["creation_fingerprint"] is None, (
         "the 0.4 insert shape is still legal and still satisfies the constraint"
     )
+
+
+def test_0012_refuses_a_corrupt_pre_existing_binding_atomically(legacy_db):
+    """API 0.4 could create a cross-tenant binding, so history may hold one.
+
+    It proved neither parent visible before writing, and its foreign keys
+    referenced globally keyed parents. Treating existing corruption as impossible
+    would be assuming the absence of the very defect 0012 exists to close.
+
+    0012 must then fail as a unit: the row it refused is still there for an
+    operator to dispose of, the schema is unchanged, and — the part that would be
+    silent and total — forced row-level security is not left switched off.
+    """
+    for migration in EXPAND[:5]:                       # through 0011
+        _apply(legacy_db, migration)
+
+    mine = _new_tenant(legacy_db, "mine")
+    theirs = _new_tenant(legacy_db, "theirs")
+    block = _insert_block(legacy_db, mine, "Mine", b"\x44" * 32)["id"]
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (theirs,))
+        project = conn.execute(
+            "insert into blocks.projects (tenant_id, name) values (%s, 'Theirs')"
+            " returning id::text as id", (theirs,)
+        ).fetchone()["id"]
+        conn.commit()
+    # The corrupt row: child claims `mine`, project belongs to `theirs`.
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (mine,))
+        conn.execute(
+            "insert into blocks.block_bindings (tenant_id, block_id, project_id)"
+            " values (%s, %s, %s)", (mine, block, project))
+        conn.commit()
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        _apply(legacy_db, BLOCKID)
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("alter table blocks.block_bindings no force row level security")
+        surviving = conn.execute(
+            "select count(*) as n from blocks.block_bindings").fetchone()["n"]
+        conn.execute("alter table blocks.block_bindings force row level security")
+        assert surviving == 1, "the refused row is left for disposition, not deleted"
+
+        cols = {r["column_name"] for r in conn.execute(
+            "select column_name from information_schema.columns"
+            " where table_schema='blocks' and table_name='physical_blocks'").fetchall()}
+        assert "client_id" not in cols, "0012 rolled back as a unit; no partial schema"
+
+        forced = {r["relname"]: r["relforcerowsecurity"] for r in conn.execute(
+            "select relname, relforcerowsecurity from pg_class"
+            " where relname in ('block_bindings','physical_blocks','projects')").fetchall()}
+        assert all(forced.values()), f"FORCE RLS must not be left disabled: {forced}"
+
+
+def test_the_preflight_finds_the_corruption_0012_would_refuse(legacy_db):
+    """Run before migrating, so a finding stops the deploy with the data intact."""
+    import subprocess
+    import sys
+
+    for migration in EXPAND[:5]:
+        _apply(legacy_db, migration)
+    mine = _new_tenant(legacy_db, "mine")
+    clean = subprocess.run(
+        [sys.executable, "tools/preflight_bindings.py", "--dsn", _dsn(legacy_db)],
+        capture_output=True, text=True)
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+
+    theirs = _new_tenant(legacy_db, "theirs")
+    block = _insert_block(legacy_db, mine, "Mine", b"\x55" * 32)["id"]
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (theirs,))
+        project = conn.execute(
+            "insert into blocks.projects (tenant_id, name) values (%s, 'Theirs')"
+            " returning id::text as id", (theirs,)).fetchone()["id"]
+        conn.commit()
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (mine,))
+        conn.execute(
+            "insert into blocks.block_bindings (tenant_id, block_id, project_id)"
+            " values (%s, %s, %s)", (mine, block, project))
+        conn.commit()
+
+    found = subprocess.run(
+        [sys.executable, "tools/preflight_bindings.py", "--dsn", _dsn(legacy_db)],
+        capture_output=True, text=True)
+    assert found.returncode != 0, "a finding must stop the deploy"
+    assert "project" in found.stdout.lower()
+    assert "1" in found.stdout, "the count is reported"
