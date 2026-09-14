@@ -1,9 +1,14 @@
 # Immutable runtime image for the Blocks Service API process.
 #
-# NOT YET BUILT OR RUN. The development seat has no container runtime, so this
-# file is authored against the deployment contract but unverified. See the
-# `blocks-service-seat-capabilities` need in the Atlas vault; the first build
-# must happen before the blocks-deployment contract moves off draft.
+# Built and run by the estate, not from this seat: no development seat carries a
+# container runtime, by operator ruling, so the image is built by the orchestrator
+# and runs in the stack as `blocks-api:8080`. The header used to say the image had
+# never been built and that no deployment contract was active; both stopped being
+# true some time ago.
+#
+# `blocks-deployment` 0.4 is an accepted contract and 0.5 is accepted alongside the
+# API 0.5 line. Acceptance is not deployment: the estate's development-tagged image
+# is unchanged until the separate cutover act, and nothing here authorises one.
 
 FROM python:3.12-slim AS build
 
