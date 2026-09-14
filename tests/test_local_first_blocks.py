@@ -703,15 +703,25 @@ async def test_no_client_surface_ever_echoes_the_supplied_token(client, auth):
     assert token not in collision.text, "not in a token-collision conflict"
 
     cid = first.json()["client_id"]
+    # Retain the token THIS request sends and assert against that exact value.
+    # Asserting the first token's absence would pass even if the rejected one
+    # leaked — the surface under test is the response to the request that was
+    # actually refused.
+    rejected_token = canonical_token()
     reused = await client.post(path, headers=auth("alice"), json={
-        "label": "Renamed", "client_id": cid, "tag_token": canonical_token()})
+        "label": "Renamed", "client_id": cid, "tag_token": rejected_token})
     assert reused.status_code == 409
-    assert token not in reused.text, "not in an identity conflict"
+    assert rejected_token not in reused.text, "the rejected token is not echoed"
+    assert token not in reused.text, "nor is the stored one"
 
+    malformed_token = canonical_token() + "x"
     malformed = await client.post(path, headers=auth("alice"), json={
-        "label": "Workbench", "client_id": str(uuid.uuid4()), "tag_token": token + "x"})
+        "label": "Workbench", "client_id": str(uuid.uuid4()), "tag_token": malformed_token})
     assert malformed.status_code == 400
-    assert token not in malformed.text, "not echoed back by a validation failure"
+    assert malformed_token not in malformed.text, (
+        "a validation failure does not quote the value it refused"
+    )
+    assert token not in malformed.text
 
 
 # --------------------------------------------------------------------------

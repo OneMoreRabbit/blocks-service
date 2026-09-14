@@ -30,6 +30,17 @@ BLOCKID = EXPAND[5]       # 0012 — client-generated block identity
 SCRATCH = "blocks_migration_drill"
 
 
+def _backup_dsn(dbname: str) -> str:
+    """The RLS-exempt READ credential the preflight requires."""
+    import os
+    import pathlib as _p
+
+    pw = _p.Path(os.path.expanduser("~/.secrets/blocks_backup_password")).read_text().strip()
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    return f"host={host} port={port} user=blocks_backup password={pw} dbname={dbname}"
+
+
 def _dsn(dbname: str) -> str:
     from tests.conftest import ADMIN_DSN, _swap_dbname
 
@@ -46,7 +57,11 @@ def legacy_db() -> Iterator[str]:
         conn.execute(f'create database "{SCRATCH}"')
         conn.execute(
             f'grant connect on database "{SCRATCH}"'
-            " to blocks_owner, blocks_migrator, blocks_app, blocks_dispatcher"
+            # blocks_backup too: the binding preflight runs as the RLS-exempt read
+            # role, which is the point of it -- an audit that cannot see across
+            # tenants would report "clean" from a blind connection.
+            " to blocks_owner, blocks_migrator, blocks_app, blocks_dispatcher,"
+            " blocks_backup"
         )
         conn.execute(f'grant create on database "{SCRATCH}" to blocks_owner')
     with psycopg.connect(_dsn(SCRATCH), autocommit=True) as conn:
@@ -858,23 +873,26 @@ def test_0012_refuses_a_corrupt_pre_existing_binding_atomically(legacy_db):
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
         _apply(legacy_db, BLOCKID)
 
+    # FORCE is inspected FIRST, before this test executes any DDL of its own. An
+    # earlier version toggled FORCE off to count the row and back on again, then
+    # asserted FORCE was on -- proving only its own restoration. It would have
+    # passed against a migration that left isolation disabled.
     with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
-        conn.execute("set role blocks_owner")
-        conn.execute("alter table blocks.block_bindings no force row level security")
-        surviving = conn.execute(
-            "select count(*) as n from blocks.block_bindings").fetchone()["n"]
-        conn.execute("alter table blocks.block_bindings force row level security")
-        assert surviving == 1, "the refused row is left for disposition, not deleted"
+        forced = {r["relname"]: r["relforcerowsecurity"] for r in conn.execute(
+            "select relname, relforcerowsecurity from pg_class"
+            " where relname in ('block_bindings','physical_blocks','projects')").fetchall()}
+        assert all(forced.values()), f"FORCE RLS must not be left disabled: {forced}"
 
         cols = {r["column_name"] for r in conn.execute(
             "select column_name from information_schema.columns"
             " where table_schema='blocks' and table_name='physical_blocks'").fetchall()}
         assert "client_id" not in cols, "0012 rolled back as a unit; no partial schema"
 
-        forced = {r["relname"]: r["relforcerowsecurity"] for r in conn.execute(
-            "select relname, relforcerowsecurity from pg_class"
-            " where relname in ('block_bindings','physical_blocks','projects')").fetchall()}
-        assert all(forced.values()), f"FORCE RLS must not be left disabled: {forced}"
+    # The row itself is read through the RLS-exempt role, which needs no DDL.
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        surviving = conn.execute(
+            "select count(*) as n from blocks.block_bindings").fetchone()["n"]
+    assert surviving == 1, "the refused row is left for disposition, not deleted"
 
 
 def test_the_preflight_finds_the_corruption_0012_would_refuse(legacy_db):
@@ -886,7 +904,7 @@ def test_the_preflight_finds_the_corruption_0012_would_refuse(legacy_db):
         _apply(legacy_db, migration)
     mine = _new_tenant(legacy_db, "mine")
     clean = subprocess.run(
-        [sys.executable, "tools/preflight_bindings.py", "--dsn", _dsn(legacy_db)],
+        [sys.executable, "tools/preflight_bindings.py", "--dsn", _backup_dsn(legacy_db)],
         capture_output=True, text=True)
     assert clean.returncode == 0, clean.stdout + clean.stderr
 
@@ -908,8 +926,90 @@ def test_the_preflight_finds_the_corruption_0012_would_refuse(legacy_db):
         conn.commit()
 
     found = subprocess.run(
-        [sys.executable, "tools/preflight_bindings.py", "--dsn", _dsn(legacy_db)],
+        [sys.executable, "tools/preflight_bindings.py", "--dsn", _backup_dsn(legacy_db)],
         capture_output=True, text=True)
     assert found.returncode != 0, "a finding must stop the deploy"
     assert "project" in found.stdout.lower()
     assert "1" in found.stdout, "the count is reported"
+
+
+def _security_snapshot(dbname: str) -> dict:
+    """Everything the audit must not be able to move. Read-only itself."""
+    with psycopg.connect(_backup_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        force = {r["relname"]: r["relforcerowsecurity"] for r in conn.execute(
+            "select relname, relforcerowsecurity from pg_class c"
+            " join pg_namespace n on n.oid = c.relnamespace"
+            " where n.nspname = 'blocks' and c.relkind = 'r'").fetchall()}
+        cols = sorted(r["c"] for r in conn.execute(
+            "select table_name || '.' || column_name as c"
+            " from information_schema.columns where table_schema = 'blocks'").fetchall())
+        rows = conn.execute(
+            "select count(*) as n from blocks.block_bindings").fetchone()["n"]
+    return {"force": force, "columns": cols, "bindings": rows}
+
+
+def _run_preflight(dsn: str):
+    import subprocess
+    import sys
+
+    return subprocess.run(
+        [sys.executable, "tools/preflight_bindings.py", "--dsn", dsn],
+        capture_output=True, text=True)
+
+
+def test_the_preflight_changes_nothing_on_any_path(legacy_db):
+    """Clean, finding, and execution-error alike.
+
+    The first version of this tool lifted FORCE RLS on three tables so the owner
+    could read across tenants, and restored it afterwards. The lift is a committed
+    schema change, so a failure between lift and restore leaves tenant isolation
+    switched off — the safety check becomes the outage. A tool that runs *because*
+    something might be wrong must not be able to make things worse.
+    """
+    for migration in EXPAND[:5]:
+        _apply(legacy_db, migration)
+    before = _security_snapshot(legacy_db)
+
+    clean = _run_preflight(_backup_dsn(legacy_db))
+    assert clean.returncode == 0
+    assert _security_snapshot(legacy_db) == before, "clean path moved something"
+
+    # Now make it find one.
+    mine, theirs = _new_tenant(legacy_db, "mine"), _new_tenant(legacy_db, "theirs")
+    block = _insert_block(legacy_db, mine, "Mine", b"\x66" * 32)["id"]
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (theirs,))
+        project = conn.execute(
+            "insert into blocks.projects (tenant_id, name) values (%s, 'Theirs')"
+            " returning id::text as id", (theirs,)).fetchone()["id"]
+        conn.commit()
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (mine,))
+        conn.execute(
+            "insert into blocks.block_bindings (tenant_id, block_id, project_id)"
+            " values (%s, %s, %s)", (mine, block, project))
+        conn.commit()
+
+    with_finding = _security_snapshot(legacy_db)
+    found = _run_preflight(_backup_dsn(legacy_db))
+    assert found.returncode == 1
+    assert _security_snapshot(legacy_db) == with_finding, "finding path moved something"
+
+    broken = _run_preflight(_backup_dsn(legacy_db).replace("dbname=", "dbname=no_such_db_"))
+    assert broken.returncode == 2, "an audit that cannot run is a stop, not a pass"
+    assert _security_snapshot(legacy_db) == with_finding, "error path moved something"
+
+
+def test_the_preflight_refuses_a_credential_that_cannot_see_across_tenants(legacy_db):
+    """"No findings" from a blind connection is the most dangerous possible answer."""
+    for migration in EXPAND[:5]:
+        _apply(legacy_db, migration)
+    before = _security_snapshot(legacy_db)
+
+    result = _run_preflight(_dsn(legacy_db))          # blocks_test_admin: not BYPASSRLS
+
+    assert result.returncode == 2, "fail closed rather than report a meaningless clean"
+    assert "row-level security" in result.stderr.lower()
+    assert _security_snapshot(legacy_db) == before

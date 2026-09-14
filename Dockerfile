@@ -24,6 +24,11 @@ RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin bloc
 COPY --from=build /opt/venv /opt/venv
 COPY migrations/ /app/migrations/
 COPY tools/migrate.py /app/tools/migrate.py
+# The deployment contract requires the binding preflight to run immediately
+# before 0012. A required command absent from the artifact the estate deploys
+# is not a deployable contract, so it ships from the same tagged source as the
+# migrations it gates.
+COPY tools/preflight_bindings.py /app/tools/preflight_bindings.py
 COPY contracts/ /app/contracts/
 
 ENV PATH="/opt/venv/bin:$PATH" \

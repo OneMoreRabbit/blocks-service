@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """Audit block bindings for cross-tenant parents, BEFORE migration 0012.
 
-Run this as a deploy step immediately before applying `0012`. It reports bindings
-whose block or project belongs to a different tenant than the binding claims.
+Run as a deploy step immediately before applying `0012`, from the release image:
 
-Such a row is possible in real history. API 0.4 wrote a binding without proving
-either parent was visible in the caller's tenant, and `block_bindings` referenced
-globally keyed parents, so a guessed or stale id from another tenant satisfied the
-foreign key while the child row claimed the caller's tenant. `0012` adds the
-tenant-composite keys that refuse that shape -- which means a database holding one
-cannot be migrated until somebody decides what the row should have been.
+  python /app/tools/preflight_bindings.py --dsn "<blocks_backup DSN>"
 
-**This tool never repairs anything.** It exits non-zero and stops the deploy. A
-finding is an architecture and operator decision: the binding records that a
-physical tag was pointed at a project, and deleting or re-homing it silently would
-destroy the only evidence of what happened and could detach a tag a user is still
-tapping. Disposition belongs to people who can ask which tenant was wronged.
+**Read-only, and structurally so.** An earlier version lifted `FORCE ROW LEVEL
+SECURITY` on three tables so the owner could see across tenants, and restored it
+afterwards. That was wrong in a way worth naming: the lift is a committed schema
+change, so a failure between the lift and the restore -- a dropped connection, a
+killed process, an error in the audit itself -- leaves tenant isolation switched
+off on a production database, and the safety check becomes the outage. A tool that
+runs *because* something might be wrong must not be able to make things worse.
 
-  python tools/preflight_bindings.py --dsn "<migrator or owner dsn>"
+So it does not lift anything. It connects with an explicitly RLS-exempt read
+credential -- Blocks already has `blocks_backup` for exactly this: `BYPASSRLS`,
+`pg_read_all_data`, and no write grant of any kind -- and it **verifies that
+exemption before trusting a clean result**. Without it the audit would see nothing
+and report success, which is the most dangerous possible answer: "no findings"
+from a connection that cannot see findings. That case fails closed.
 
-Exit codes: 0 clean, 1 findings, 2 could not audit.
+The session is additionally pinned read-only, so even a mistake in this file
+cannot write.
+
+Exit codes: 0 clean, 1 findings, 2 could not audit (also a stop).
 """
 
 from __future__ import annotations
@@ -44,29 +48,41 @@ where pb.tenant_id is distinct from b.tenant_id
 order by b.id
 """
 
+CAPABILITY = """
+select rolbypassrls, rolsuper, rolcanlogin
+from pg_roles where rolname = current_user
+"""
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dsn", required=True)
+    parser.add_argument(
+        "--dsn",
+        required=True,
+        help="An RLS-exempt READ credential (blocks_backup). Not the migrator, "
+             "and not the owner: this audit must not be able to write.",
+    )
     args = parser.parse_args()
 
     try:
         with psycopg.connect(args.dsn, row_factory=dict_row, autocommit=True) as conn:
-            # The audit must see every tenant's rows; that is the whole point, and
-            # it is why this runs as a privileged deploy step rather than through
-            # the application role. FORCE is lifted for the read and restored in
-            # the same connection, so an interrupted audit cannot leave isolation
-            # switched off for the migration that follows.
-            conn.execute("set role blocks_owner")
-            conn.execute("alter table blocks.block_bindings no force row level security")
-            conn.execute("alter table blocks.physical_blocks no force row level security")
-            conn.execute("alter table blocks.projects no force row level security")
-            try:
-                findings = conn.execute(AUDIT).fetchall()
-            finally:
-                conn.execute("alter table blocks.block_bindings force row level security")
-                conn.execute("alter table blocks.physical_blocks force row level security")
-                conn.execute("alter table blocks.projects force row level security")
+            # Read-only for the whole session. Belt to the braces of using a role
+            # with no write grants: two independent reasons this cannot mutate.
+            conn.execute("set default_transaction_read_only = on")
+
+            role = conn.execute(CAPABILITY).fetchone()
+            if role is None or not (role["rolbypassrls"] or role["rolsuper"]):
+                print(
+                    "preflight: this credential is NOT exempt from row-level security, "
+                    "so it cannot see bindings across tenants.\n"
+                    "A clean result from it would be meaningless -- an audit that cannot "
+                    "see a finding reporting none is the most dangerous possible answer.\n"
+                    "Re-run with the blocks_backup role (BYPASSRLS, read-only).",
+                    file=sys.stderr,
+                )
+                return 2
+
+            findings = conn.execute(AUDIT).fetchall()
     except psycopg.Error as exc:
         print(f"preflight: could not audit bindings: {exc}", file=sys.stderr)
         return 2
@@ -85,10 +101,11 @@ def main() -> int:
         print(f"  binding {row['binding_id']} claims tenant {row['claimed_tenant']}: "
               + ", ".join(wrong))
     print(
-        "\nNothing has been changed. 0012 would refuse these rows and roll back.\n"
-        "Disposition is an architecture and operator decision: the binding is the\n"
-        "record that a physical tag was pointed at a project, so it is not this\n"
-        "tool's to delete, rewrite or re-home."
+        "\nNothing has been changed; this tool cannot change anything.\n"
+        "0012 would refuse these rows and roll back -- it remains the fail-closed\n"
+        "authority if a write races this audit. Disposition is an architecture and\n"
+        "operator decision: the binding is the record that a physical tag was pointed\n"
+        "at a project, so it is not this tool's to delete, rewrite or re-home."
     )
     return 1
 
