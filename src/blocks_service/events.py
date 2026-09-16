@@ -33,6 +33,15 @@ EVENT_VERSIONS: Final[dict[str, str]] = {
     "project.reopened": "0.1",
     "project.notes_saved": "0.1",
     "project.parked": "0.1",
+    "project.note_created": "0.1",
+    "project.note_edited": "0.1",
+    "project.note_pinned": "0.1",
+    "project.note_deleted": "0.1",
+    "project.link_created": "0.1",
+    "project.link_edited": "0.1",
+    "project.link_deleted": "0.1",
+    # Discrete project items (ADR-0021). Identifier-only, like every event
+    # above: the body a note now carries is exactly what must not travel here.
     "session.started": "0.1",
     "session.parked": "0.1",
     "session.resumed": "0.1",

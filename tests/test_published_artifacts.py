@@ -26,12 +26,13 @@ CONTRACTS = (
     "blocks-service-api-contract-v0_3.md",
     "blocks-service-api-contract-v0_4.md",
     "blocks-service-api-contract-v0_5.md",
+    "blocks-service-api-contract-v0_6.md",
 )
 
 #: The version the service currently generates. Older published contracts are
 #: immutable: their artefacts are the bytes consumers were handed, and a stale
 #: comparison against the live app would be asserting that history should change.
-CURRENT = "0_5"
+CURRENT = "0_6"
 
 pytestmark = pytest.mark.skipif(
     not PROVIDES.is_dir(), reason="vault clone not present; run scripts/atlas-context.sh"
@@ -132,7 +133,7 @@ def test_the_superseded_contracts_are_untouched_by_the_current_service():
     Their hashes are declared and consumers were handed those exact bytes. This is
     the assertion that catches a regeneration accidentally overwriting them.
     """
-    for older in ("0_1", "0_2", "0_3", "0_4"):
+    for older in ("0_1", "0_2", "0_3", "0_4", "0_5"):
         for name, declared in _declared(f"blocks-service-api-contract-v{older}.md"):
             actual = hashlib.sha256(_resolve(name).read_bytes()).hexdigest()
             assert actual == declared, f"{name} moved under published {older}"
