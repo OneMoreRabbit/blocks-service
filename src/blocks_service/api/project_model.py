@@ -97,6 +97,16 @@ class ProjectOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     archived_at: datetime | None
+    navigation_key: UUID | None = Field(
+        default=None,
+        description=(
+            "The project's stable navigation key, when one has been attached — the "
+            "value in `https://api.blocks.onemorerabbit.co.uk/p/v1/<key>`. A "
+            "**distinct identity** from `client_id`: a key allocated before or "
+            "independently of Service identity stays distinct and is never rotated "
+            "into the creation identity. At most one per project."
+        ),
+    )
 
 
 class NotesIn(BaseModel):

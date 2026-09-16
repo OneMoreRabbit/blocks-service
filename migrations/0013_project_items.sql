@@ -74,8 +74,13 @@ create table blocks.project_resource_links (
   -- The allowlist Android publishes, enforced in the database as well as the
   -- handler. Service stores a logical value; it never resolves, fetches or
   -- launches it.
+  -- Case-insensitive: schemes are case-insensitive (RFC 3986 section 3.1) and the
+  -- handler accepts them that way. A case-sensitive check here rejected on insert
+  -- a value the handler had already accepted, so the two layers disagreed about
+  -- what is storable. They now share one rule; the handler additionally rejects
+  -- malformed authorities this pattern cannot see.
   constraint project_resource_links_uri_scheme
-    check (uri ~ '^(https?|obsidian)://'),
+    check (uri ~* '^(https?|obsidian):'),
   constraint project_resource_links_row_version_positive check (row_version >= 1)
 );
 
@@ -105,8 +110,47 @@ create table blocks.project_navigation_aliases (
     references blocks.projects (tenant_id, id) on delete cascade
 );
 
-create index project_navigation_aliases_project_idx
+-- ONE key per project, and (by the primary key) one project per key. Android holds
+-- a single `ProjectLinkIdentity` per project, so a second key for the same project
+-- is not an alias -- it is a conflict with a link already printed on a tag or QR,
+-- and it must be refused rather than stored beside it.
+create unique index project_navigation_aliases_one_per_project
   on blocks.project_navigation_aliases (tenant_id, project_id);
+
+-- ---------------------------------------------------------------------------
+-- Operation receipts
+-- ---------------------------------------------------------------------------
+--
+-- `operation_id` is the identity an offline client retires a queued mutation
+-- against, so echoing it is not enough: it has to be ENFORCED. Without a durable
+-- receipt, an edit retried after an ambiguous response ran again or reported a
+-- stale-version conflict for a write that had in fact succeeded, and one
+-- operation id could be spent on several resources -- either of which can make a
+-- client retire the wrong queue entry.
+--
+-- A receipt binds the operation to its complete immutable envelope: project, item,
+-- mutation type, If-Match and payload. The same envelope replays the recorded
+-- result with no second write and no second event; anything else under that id is
+-- a conflict. Tenant-scoped by composite key, for the usual reason -- no global
+-- index for a retry to probe.
+
+create table blocks.project_item_operations (
+  tenant_id            uuid        not null references blocks.tenants (id) on delete cascade,
+  operation_id         uuid        not null,
+  project_id           uuid        not null,
+  item_kind            text        not null,
+  item_id              uuid        not null,
+  mutation             text        not null,
+  envelope_fingerprint bytea       not null,
+  accepted_row_version integer     not null,
+  accepted_at          timestamptz not null default now(),
+  primary key (tenant_id, operation_id),
+  foreign key (tenant_id, project_id)
+    references blocks.projects (tenant_id, id) on delete cascade,
+  constraint project_item_operations_kind check (item_kind in ('note', 'link')),
+  constraint project_item_operations_mutation
+    check (mutation in ('create', 'edit', 'pin', 'delete'))
+);
 
 -- ---------------------------------------------------------------------------
 -- Tenancy
@@ -115,10 +159,12 @@ create index project_navigation_aliases_project_idx
 alter table blocks.project_note_items        enable row level security;
 alter table blocks.project_resource_links    enable row level security;
 alter table blocks.project_navigation_aliases enable row level security;
+alter table blocks.project_item_operations   enable row level security;
 
 alter table blocks.project_note_items        force row level security;
 alter table blocks.project_resource_links    force row level security;
 alter table blocks.project_navigation_aliases force row level security;
+alter table blocks.project_item_operations   force row level security;
 
 create policy project_note_items_tenant on blocks.project_note_items
   using (tenant_id = current_setting('blocks.tenant_id', true)::uuid)
@@ -132,10 +178,17 @@ create policy project_navigation_aliases_tenant on blocks.project_navigation_ali
   using (tenant_id = current_setting('blocks.tenant_id', true)::uuid)
   with check (tenant_id = current_setting('blocks.tenant_id', true)::uuid);
 
+create policy project_item_operations_tenant on blocks.project_item_operations
+  using (tenant_id = current_setting('blocks.tenant_id', true)::uuid)
+  with check (tenant_id = current_setting('blocks.tenant_id', true)::uuid);
+
 -- Deletion is a tombstone, so DELETE is granted nowhere: `blocks_app` can set
 -- `deleted_at` and nothing else can remove the row's history.
 grant select, insert, update on blocks.project_note_items         to blocks_app;
 grant select, insert, update on blocks.project_resource_links     to blocks_app;
 grant select, insert         on blocks.project_navigation_aliases to blocks_app;
+-- Receipts are append-only: a recorded operation can be read and replayed, never
+-- rewritten or removed.
+grant select, insert         on blocks.project_item_operations    to blocks_app;
 
 -- The dispatcher reads the outbox only; it needs nothing here.
