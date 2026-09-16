@@ -23,9 +23,7 @@ anywhere in this module (ADR-0022).
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import re
-from urllib.parse import urlsplit
 from uuid import UUID
 
 import psycopg
@@ -46,10 +44,6 @@ LINK_COLUMNS = (
     " row_version, deleted_at, last_operation_id"
 )
 
-_CONTROL = re.compile(r"[\x00-\x20\x7f]")      # control chars AND spaces
-_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-
-
 class ItemConflict(ConcurrencyConflict):
     """An identity is already used here by a different operation or creation."""
 
@@ -67,82 +61,95 @@ class InvalidItem(DomainError):
 
 
 # ---------------------------------------------------------------------------
-# URI validation -- ONE canonical rule, shared by handler and database
+# URI validation -- ONE rule, evaluated identically by handler and database
 # ---------------------------------------------------------------------------
+#
+# The rule is a single regular expression. Python evaluates it with
+# `re.fullmatch`; migration 0013 carries the same string, byte for byte, as
+# `project_resource_links_uri_valid` (`uri ~ '<pattern>'`). There is no second
+# implementation to drift: a test reads the live constraint back and compares it
+# with LINK_URI_PATTERN, then runs one accepted/refused corpus through both.
+#
+# It is written in the subset where Python `re` and PostgreSQL AREs agree: bracket
+# classes, groups, alternation, bounded repetition, `^`/`$` over a string with no
+# newline (control characters are outside every class). Case-insensitivity is
+# spelled out in the classes, not delegated to a flag either engine could read
+# differently.
+
+_H16 = "[0-9A-Fa-f]{1,4}"
+_OCTET = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+_IPV4 = f"({_OCTET}[.]){{3}}{_OCTET}"
+_IPV6 = "(" + "|".join([
+    f"({_H16}:){{7}}{_H16}",
+    f"({_H16}:){{1,7}}:",
+    f"({_H16}:){{1,6}}:{_H16}",
+    f"({_H16}:){{1,5}}(:{_H16}){{1,2}}",
+    f"({_H16}:){{1,4}}(:{_H16}){{1,3}}",
+    f"({_H16}:){{1,3}}(:{_H16}){{1,4}}",
+    f"({_H16}:){{1,2}}(:{_H16}){{1,5}}",
+    f"{_H16}:(:{_H16}){{1,6}}",
+    f":((:{_H16}){{1,7}}|:)",
+    f"({_H16}:){{6}}{_IPV4}",
+    f"({_H16}:){{1,5}}:{_IPV4}",
+    f"({_H16}:){{1}}(:{_H16}){{1,4}}:{_IPV4}",
+    f"({_H16}:){{2}}(:{_H16}){{1,3}}:{_IPV4}",
+    f"({_H16}:){{3}}(:{_H16}){{1,2}}:{_IPV4}",
+    f"({_H16}:){{4}}(:{_H16}){{1}}:{_IPV4}",
+    f"::({_H16}:){{0,5}}{_IPV4}",
+]) + ")"
+_LABEL = "[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+# The last label starts with a letter, so an all-numeric dotted host is only ever
+# read as IPv4 -- `999.1.1.1` is refused rather than accepted as a DNS name.
+_TOP_LABEL = "[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_DNS_NAME = f"({_LABEL}[.])*{_TOP_LABEL}[.]?"
+_PORT = ("(6553[0-5]|655[0-2][0-9]|65[0-4][0-9][0-9]|6[0-4][0-9][0-9][0-9]"
+         "|[1-5][0-9][0-9][0-9][0-9]|[1-9][0-9]{0,3})")
+_VISIBLE = "[!-~]"                   # printable ASCII: no control, space or non-ASCII
+_AUTHORITY_CHAR = '[!-"$-.0->A-~]'   # visible, minus / ? # @ (no user-info)
+_DESTINATION_CHAR = '[!-"$-.0->@-~]' # visible, minus / ? #
+_HTTP = (f"[Hh][Tt][Tt][Pp][Ss]?://({_DNS_NAME}|{_IPV4}|\\[{_IPV6}\\])"
+         f"(:{_PORT})?([/?#]{_VISIBLE}*)?")
+_OBSIDIAN = (
+    "[Oo][Bb][Ss][Ii][Dd][Ii][Aa][Nn]:("
+    f"//{_AUTHORITY_CHAR}+([/?#]{_VISIBLE}*)?"             # obsidian://open?vault=...
+    f"|//(/+[?]?|[?]){_DESTINATION_CHAR}{_VISIBLE}*"       # obsidian:///path, ://?q
+    f"|/?[?]?{_DESTINATION_CHAR}{_VISIBLE}*"               # obsidian:open
+    ")"
+)
+
+#: The complete link-URI rule. Migration 0013 must carry exactly this string.
+LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN})$"
+_LINK_URI = re.compile(LINK_URI_PATTERN)
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
 def validate_uri(raw: str) -> str:
     """Accept a logical link URI, or refuse it. Never resolve, fetch or launch it.
 
-    The rule, stated once so the handler and the database constraint can agree on
-    it (the review found they did not):
+    Surrounding whitespace is trimmed and the trimmed value is what is stored and
+    returned; the ACCEPT/REFUSE decision is then exactly LINK_URI_PATTERN, the
+    same expression the database constraint evaluates:
 
-    * surrounding whitespace is trimmed; the trimmed value is what is stored and
-      returned;
-    * no control characters and no interior whitespace;
-    * the scheme is `http`, `https` or `obsidian`, compared CASE-INSENSITIVELY
-      (RFC 3986 section 3.1), and preserved as written. The database check uses
-      `~*` for the same reason, so a value accepted here can never be rejected on
-      insert;
-    * `http`/`https` need a well-formed authority: a host that is a valid DNS
-      name or IP literal, a numeric port in range if present, and no user-info;
-    * `obsidian` needs a non-empty destination.
+    * the scheme is `http`, `https` or `obsidian`, in any case, preserved as sent;
+    * printable ASCII only -- no control characters, whitespace or raw non-ASCII
+      (RFC 3986: an IRI is sent percent-encoded);
+    * `http`/`https` need an authority whose host is a DNS name, an IPv4 address or
+      a bracketed IPv6 literal, an optional port 1-65535, and no user-info;
+    * `obsidian` needs a non-empty destination, and no user-info in an authority.
 
-    Every accepted value therefore satisfies the database constraint, which is the
-    invariant a shared corpus test checks directly.
+    The refusal messages only explain which part failed; they never change the
+    decision, and they never echo the value.
     """
     uri = raw.strip()
+    if _LINK_URI.fullmatch(uri):
+        return uri
     if not uri:
         raise InvalidItem("uri must not be empty")
-    if _CONTROL.search(uri):
-        raise InvalidItem("uri must not contain control characters or whitespace")
-    try:
-        parts = urlsplit(uri)
-    except ValueError as exc:
-        raise InvalidItem("uri is malformed") from exc
-
-    scheme = parts.scheme.lower()
-    if scheme not in ALLOWED_SCHEMES:
+    scheme = _SCHEME.match(uri)
+    if not scheme or scheme.group(1).lower() not in ALLOWED_SCHEMES:
         raise InvalidItem("uri scheme must be one of " + ", ".join(ALLOWED_SCHEMES))
-
-    if scheme in ("http", "https"):
-        if not uri[len(parts.scheme):].startswith("://"):
-            raise InvalidItem("http and https uris must have an authority")
-        if "@" in parts.netloc:
-            raise InvalidItem("uri must not carry user-info credentials")
-        try:
-            host = parts.hostname
-            port = parts.port                       # raises on a malformed port
-        except ValueError as exc:
-            raise InvalidItem("uri authority is malformed") from exc
-        if not host or not _valid_host(host, parts.netloc):
-            raise InvalidItem("http and https uris require a valid host")
-        if port is not None and not (0 < port <= 65535):
-            raise InvalidItem("uri port is out of range")
-    else:  # obsidian
-        if not (parts.netloc or parts.path.strip("/") or parts.query):
-            raise InvalidItem("obsidian uris require a destination")
-
-    return uri
-
-
-def _valid_host(host: str, netloc: str) -> bool:
-    if "[" in netloc or "]" in netloc:
-        # An IPv6 literal must be bracketed exactly once and parse.
-        if netloc.count("[") != 1 or netloc.count("]") != 1:
-            return False
-        try:
-            ipaddress.IPv6Address(host)
-            return True
-        except ValueError:
-            return False
-    try:
-        ipaddress.IPv4Address(host)
-        return True
-    except ValueError:
-        pass
-    labels = host.rstrip(".").split(".")
-    return bool(labels) and all(_HOST_LABEL.match(label) for label in labels)
+    raise InvalidItem("uri is not well formed: it needs a valid host or destination, "
+                      "printable ASCII only, and no user-info")
 
 
 # ---------------------------------------------------------------------------

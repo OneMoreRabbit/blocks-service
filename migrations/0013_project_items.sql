@@ -71,16 +71,17 @@ create table blocks.project_resource_links (
   constraint project_resource_links_title_length
     check (length(title) > 0 and length(title) <= 200),
   constraint project_resource_links_title_not_blank check (length(btrim(title)) > 0),
-  -- The allowlist Android publishes, enforced in the database as well as the
-  -- handler. Service stores a logical value; it never resolves, fetches or
-  -- launches it.
-  -- Case-insensitive: schemes are case-insensitive (RFC 3986 section 3.1) and the
-  -- handler accepts them that way. A case-sensitive check here rejected on insert
-  -- a value the handler had already accepted, so the two layers disagreed about
-  -- what is storable. They now share one rule; the handler additionally rejects
-  -- malformed authorities this pattern cannot see.
-  constraint project_resource_links_uri_scheme
-    check (uri ~* '^(https?|obsidian):'),
+  -- The link-URI rule Android publishes, enforced by the database with the SAME
+  -- expression the handler evaluates: this literal is
+  -- `blocks_service.project_items.LINK_URI_PATTERN`, byte for byte, and a test
+  -- reads it back from the catalogue to prove it. One rule, two evaluators, one
+  -- decision: allowlisted scheme in any case (http, https, obsidian); printable
+  -- ASCII only; http/https need a DNS, IPv4 or bracketed IPv6 host, an optional
+  -- port 1-65535 and no user-info; obsidian needs a non-empty destination.
+  -- A value the handler refuses therefore cannot be stored by `blocks_app` either.
+  -- Service stores a logical value; it never resolves, fetches or launches it.
+  constraint project_resource_links_uri_valid
+    check (uri ~ '^([Hh][Tt][Tt][Pp][Ss]?://(([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?[.])*[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?[.]?|((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|\[(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:((:[0-9A-Fa-f]{1,4}){1,7}|:)|([0-9A-Fa-f]{1,4}:){6}((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|([0-9A-Fa-f]{1,4}:){1,5}:((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|([0-9A-Fa-f]{1,4}:){1}(:[0-9A-Fa-f]{1,4}){1,4}:((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|([0-9A-Fa-f]{1,4}:){2}(:[0-9A-Fa-f]{1,4}){1,3}:((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|([0-9A-Fa-f]{1,4}:){3}(:[0-9A-Fa-f]{1,4}){1,2}:((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|([0-9A-Fa-f]{1,4}:){4}(:[0-9A-Fa-f]{1,4}){1}:((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|::([0-9A-Fa-f]{1,4}:){0,5}((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])[.]){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))\])(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9][0-9]|6[0-4][0-9][0-9][0-9]|[1-5][0-9][0-9][0-9][0-9]|[1-9][0-9]{0,3}))?([/?#][!-~]*)?|[Oo][Bb][Ss][Ii][Dd][Ii][Aa][Nn]:(//[!-"$-.0->A-~]+([/?#][!-~]*)?|//(/+[?]?|[?])[!-"$-.0->@-~][!-~]*|/?[?]?[!-"$-.0->@-~][!-~]*))$'),
   constraint project_resource_links_row_version_positive check (row_version >= 1)
 );
 

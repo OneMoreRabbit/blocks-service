@@ -28,8 +28,8 @@ OPERATION_ID = Field(
     description=(
         "**The durable identity of this mutation.** Service records a receipt bound "
         "to the complete envelope — project, item, mutation type, If-Match and "
-        "payload. Resending the exact envelope returns the recorded result with no "
-        "second write and no second event; reusing the id with any other envelope "
+        "payload. Resending the exact envelope acknowledges this same operation again "
+        "over the item's current state, with no second write and no second event; reusing the id with any other envelope "
         "is `409`. Never rotate it on timeout, restart or an ambiguous response."
     )
 )
@@ -45,8 +45,9 @@ class _Item(BaseModel):
     deleted_at: datetime | None = Field(
         description="Set once tombstoned. Terminal: the row is retained and accepts no "
                     "further mutation except an exact replay of that delete.")
-    operation_id: UUID = Field(
-        description="The operation whose acknowledgement produced this state.")
+    last_operation_id: UUID = Field(
+        description="The accepted operation that produced the returned state. It is "
+                    "state, not an acknowledgement: never retire an outbox entry on it.")
 
 
 class NoteOut(_Item):
@@ -59,6 +60,25 @@ class NoteOut(_Item):
 class LinkOut(_Item):
     title: str
     uri: str = Field(description="The accepted logical value, returned unchanged.")
+
+
+ACKNOWLEDGED_OPERATION_ID = Field(
+    description=(
+        "**The operation this response acknowledges** — always the `operation_id` you "
+        "sent, on the first write and on every exact replay. Retire the outbox entry on "
+        "this field. The rest of the body is the item's CURRENT authoritative state, "
+        "which a later operation may already have changed: on a replay "
+        "`last_operation_id` can differ from `operation_id`."
+    )
+)
+
+
+class NoteAck(NoteOut):
+    operation_id: UUID = ACKNOWLEDGED_OPERATION_ID
+
+
+class LinkAck(LinkOut):
+    operation_id: UUID = ACKNOWLEDGED_OPERATION_ID
 
 
 NON_BLANK = r"\S"
@@ -138,12 +158,19 @@ class ResolveKeyOut(BaseModel):
 
 
 def _out(model: type[_Item], row: dict) -> dict:
-    return model(**{**row, "operation_id": row["last_operation_id"]}).model_dump(mode="json")
+    return model(**row).model_dump(mode="json")
 
 
-def _respond(model, row: dict, replayed: bool, created_status: int) -> JSONResponse:
+def _respond(model: type[_Item], row: dict, operation_id: UUID, replayed: bool,
+             created_status: int) -> JSONResponse:
+    """Acknowledge the REQUESTED operation over the current row.
+
+    The acknowledged id comes from the request, never from the row: after A then B,
+    a retry of A must still acknowledge A, not the row's `last_operation_id` (B).
+    """
     headers = {"Idempotent-Replay": "true"} if replayed else {}
-    return JSONResponse(status_code=created_status, content=_out(model, row), headers=headers)
+    content = model(**{**row, "operation_id": operation_id}).model_dump(mode="json")
+    return JSONResponse(status_code=created_status, content=content, headers=headers)
 
 
 MUTATION_ERRORS = errors.error_responses(400, 401, 403, 404, 409, 426)
@@ -156,7 +183,7 @@ READ_ERRORS = errors.error_responses(401, 403, 404, 426)
 
 
 @router.post("/{project_id}/items/notes", status_code=status.HTTP_201_CREATED,
-             response_model=NoteOut, responses=MUTATION_ERRORS, summary="Create a note item")
+             response_model=NoteAck, responses=MUTATION_ERRORS, summary="Create a note item")
 async def create_note(
     project_id: UUID, body: NoteCreateIn, ctx: TenantContext = Depends(tenant_context),
 ) -> JSONResponse:
@@ -171,7 +198,7 @@ async def create_note(
         )
     except items.DomainError as exc:
         raise as_http(exc) from exc
-    return _respond(NoteOut, row, replayed, status.HTTP_201_CREATED)
+    return _respond(NoteAck, row, body.operation_id, replayed, status.HTTP_201_CREATED)
 
 
 @router.get("/{project_id}/items/notes", response_model=list[NoteOut],
@@ -205,10 +232,10 @@ async def _note_mutation(ctx, project_id, item_id, version, operation_id, mutati
         )
     except items.DomainError as exc:
         raise as_http(exc) from exc
-    return _respond(NoteOut, row, replayed, status.HTTP_200_OK)
+    return _respond(NoteAck, row, operation_id, replayed, status.HTTP_200_OK)
 
 
-@router.patch("/{project_id}/items/notes/{item_id}", response_model=NoteOut,
+@router.patch("/{project_id}/items/notes/{item_id}", response_model=NoteAck,
               responses=MUTATION_ERRORS, summary="Edit a note body")
 async def edit_note(project_id: UUID, item_id: UUID, body: NoteEditIn,
                     ctx: TenantContext = Depends(tenant_context),
@@ -218,7 +245,7 @@ async def edit_note(project_id: UUID, item_id: UUID, body: NoteEditIn,
                                 "project.note_edited")
 
 
-@router.put("/{project_id}/items/notes/{item_id}/pin", response_model=NoteOut,
+@router.put("/{project_id}/items/notes/{item_id}/pin", response_model=NoteAck,
             responses=MUTATION_ERRORS, summary="Pin or unpin a note")
 async def pin_note(project_id: UUID, item_id: UUID, body: NotePinIn,
                    ctx: TenantContext = Depends(tenant_context),
@@ -228,7 +255,7 @@ async def pin_note(project_id: UUID, item_id: UUID, body: NotePinIn,
                                 "project.note_pinned")
 
 
-@router.post("/{project_id}/items/notes/{item_id}/delete", response_model=NoteOut,
+@router.post("/{project_id}/items/notes/{item_id}/delete", response_model=NoteAck,
              responses=MUTATION_ERRORS, summary="Tombstone a note")
 async def delete_note(project_id: UUID, item_id: UUID, body: DeleteIn,
                       ctx: TenantContext = Depends(tenant_context),
@@ -244,7 +271,7 @@ async def delete_note(project_id: UUID, item_id: UUID, body: DeleteIn,
 
 
 @router.post("/{project_id}/items/links", status_code=status.HTTP_201_CREATED,
-             response_model=LinkOut, responses=MUTATION_ERRORS, summary="Create a resource link")
+             response_model=LinkAck, responses=MUTATION_ERRORS, summary="Create a resource link")
 async def create_link(
     project_id: UUID, body: LinkCreateIn, ctx: TenantContext = Depends(tenant_context),
 ) -> JSONResponse:
@@ -257,7 +284,7 @@ async def create_link(
         )
     except items.DomainError as exc:
         raise as_http(exc) from exc
-    return _respond(LinkOut, row, replayed, status.HTTP_201_CREATED)
+    return _respond(LinkAck, row, body.operation_id, replayed, status.HTTP_201_CREATED)
 
 
 @router.get("/{project_id}/items/links", response_model=list[LinkOut],
@@ -280,7 +307,7 @@ async def read_link(
         raise as_http(exc) from exc
 
 
-@router.patch("/{project_id}/items/links/{item_id}", response_model=LinkOut,
+@router.patch("/{project_id}/items/links/{item_id}", response_model=LinkAck,
               responses=MUTATION_ERRORS, summary="Edit a link title and URI")
 async def edit_link(project_id: UUID, item_id: UUID, body: LinkEditIn,
                     ctx: TenantContext = Depends(tenant_context),
@@ -295,10 +322,10 @@ async def edit_link(project_id: UUID, item_id: UUID, body: LinkEditIn,
         )
     except items.DomainError as exc:
         raise as_http(exc) from exc
-    return _respond(LinkOut, row, replayed, status.HTTP_200_OK)
+    return _respond(LinkAck, row, body.operation_id, replayed, status.HTTP_200_OK)
 
 
-@router.post("/{project_id}/items/links/{item_id}/delete", response_model=LinkOut,
+@router.post("/{project_id}/items/links/{item_id}/delete", response_model=LinkAck,
              responses=MUTATION_ERRORS, summary="Tombstone a resource link")
 async def delete_link(project_id: UUID, item_id: UUID, body: DeleteIn,
                       ctx: TenantContext = Depends(tenant_context),
@@ -312,7 +339,7 @@ async def delete_link(project_id: UUID, item_id: UUID, body: DeleteIn,
         )
     except items.DomainError as exc:
         raise as_http(exc) from exc
-    return _respond(LinkOut, row, replayed, status.HTTP_200_OK)
+    return _respond(LinkAck, row, body.operation_id, replayed, status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------
