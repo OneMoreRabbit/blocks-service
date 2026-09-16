@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-note_edited-v0_1.schema.json",
+  "title": "project.note_edited 0.1",
+  "description": "A discrete project note's body was edited. Identifier-only. Note bodies, link titles and URIs are user-authored and never appear in the change feed, in logs, in metrics or in error telemetry: a client learns THAT an item changed and reads the item to learn what it now says.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operationId",
+    "itemId",
+    "projectId",
+    "rowVersion",
+    "deleted"
+  ],
+  "properties": {
+    "operationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The client operation this acknowledges, so exactly one queued operation can be retired."
+    },
+    "itemId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "The client-generated item identity, echoed."
+    },
+    "projectId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "rowVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "deleted": {
+      "type": "boolean",
+      "description": "True once the item is tombstoned. The row is retained."
+    }
+  }
+}

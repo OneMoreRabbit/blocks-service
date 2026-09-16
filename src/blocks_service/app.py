@@ -11,7 +11,16 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .api import blocks, changes, health, map as map_api, project_model, session, sessions
+from .api import (
+    blocks,
+    changes,
+    health,
+    map as map_api,
+    project_items,
+    project_model,
+    session,
+    sessions,
+)
 from .api.deps import require_supported_client
 from .config import Settings, get_settings
 from .errors import ErrorCode
@@ -89,6 +98,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # superset of 0.2's, so an installed 0.2 client keeps working through the
     # declared compatibility window (ADR-0009).
     app.include_router(project_model.router, dependencies=gated)
+    app.include_router(project_items.router, dependencies=gated)
     app.include_router(blocks.router, dependencies=gated)
     app.include_router(map_api.router, dependencies=gated)
     app.include_router(sessions.router, dependencies=gated)

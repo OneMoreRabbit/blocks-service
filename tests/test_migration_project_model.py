@@ -20,13 +20,14 @@ from psycopg.rows import dict_row
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
 EXPAND = [m for m in MIGRATIONS
-          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012"))]
+          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012", "0013"))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
 SCOPED = EXPAND[3]        # 0010 — tenant-scoped client identity
 RESERVE = EXPAND[4]       # 0011 — idempotency reservation
 BLOCKID = EXPAND[5]       # 0012 — client-generated block identity
+ITEMS = EXPAND[6]         # 0013 — discrete project items
 SCRATCH = "blocks_migration_drill"
 
 
@@ -490,7 +491,11 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
     _apply(legacy_db, IDENTITY)                     # 0009
     _apply(legacy_db, SCOPED)                       # 0010
     _apply(legacy_db, RESERVE)                      # 0011
-    _apply(legacy_db, BLOCKID)                      # 0012 completes the expand step
+    _apply(legacy_db, BLOCKID)                      # 0012
+    # 0013 as well: this test then runs the CURRENT application against the
+    # schema, and a 0.6 image requires 0013 (deployment 0.6, restore boundaries).
+    # Project reads carry the navigation key, which lives in a 0013 table.
+    _apply(legacy_db, ITEMS)                        # 0013 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
@@ -1013,3 +1018,169 @@ def test_the_preflight_refuses_a_credential_that_cannot_see_across_tenants(legac
     assert result.returncode == 2, "fail closed rather than report a meaningless clean"
     assert "row-level security" in result.stderr.lower()
     assert _security_snapshot(legacy_db) == before
+
+
+# --------------------------------------------------------------------------
+# 0013 — discrete project items (API 0.6)
+# --------------------------------------------------------------------------
+#
+# The full suite applies every migration to a fresh database, which proves 0013
+# works on an empty schema and nothing else. These tests are the failure
+# boundaries the architecture review asked for: an upgrade over real data, an
+# interrupted apply, the security shape, the cardinality rules, and -- the one
+# ADR-0022 turns on -- that existing singleton Notes are preserved and never
+# projected into the new collection.
+
+
+def _project_with_singleton(dbname: str, tenant: str, name: str, body: str) -> str:
+    """A pre-0013 project whose API 0.4 singleton Notes row carries real content."""
+    with psycopg.connect(_dsn(dbname), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        project = conn.execute(
+            "insert into blocks.projects (tenant_id, name) values (%s, %s)"
+            " returning id::text as id", (tenant, name)).fetchone()["id"]
+        conn.execute("update blocks.project_notes set body = %s where project_id = %s",
+                     (body, project))
+        conn.commit()
+    return project
+
+
+def _count(dbname: str, table: str) -> int:
+    with psycopg.connect(_backup_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        return conn.execute(f"select count(*) as n from blocks.{table}").fetchone()["n"]
+
+
+def _table_exists(dbname: str, table: str) -> bool:
+    with psycopg.connect(_backup_dsn(dbname), row_factory=dict_row, autocommit=True) as conn:
+        return conn.execute(
+            "select to_regclass(%s) is not null as present", (f"blocks.{table}",)
+        ).fetchone()["present"]
+
+
+ITEM_TABLES = ("project_note_items", "project_resource_links",
+               "project_navigation_aliases", "project_item_operations")
+
+
+def test_0013_upgrades_a_database_holding_singleton_notes_without_touching_them(legacy_db):
+    """Preservation AND non-projection: ADR-0022's clean break, over real data."""
+    for migration in EXPAND[:6]:                      # through 0012
+        _apply(legacy_db, migration)
+    tenant = _new_tenant(legacy_db, "upgrade")
+    project = _project_with_singleton(legacy_db, tenant, "Kitchen", "the boiler is behind the panel")
+
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        before = conn.execute(
+            "select body, row_version, updated_at from blocks.project_notes"
+            " where project_id = %s", (project,)).fetchone()
+
+    _apply(legacy_db, ITEMS)
+
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        after = conn.execute(
+            "select body, row_version, updated_at from blocks.project_notes"
+            " where project_id = %s", (project,)).fetchone()
+    assert after == before, "the singleton row is byte-for-byte untouched"
+    assert _count(legacy_db, "project_note_items") == 0, "no item derived from any singleton"
+    assert _count(legacy_db, "project_item_operations") == 0
+
+
+def test_an_interrupted_0013_leaves_no_partial_schema_and_reapplies_cleanly(legacy_db):
+    """Transaction interruption and restart."""
+    for migration in EXPAND[:6]:
+        _apply(legacy_db, migration)
+    sql = ITEMS.read_text()
+    # Break the migration at its very end, after every table has been created, so
+    # a non-atomic apply would leave all of them behind.
+    broken = sql + "\nselect 1/0;\n"
+
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            conn.execute(broken)
+        conn.rollback()
+
+    for table in ITEM_TABLES:
+        assert not _table_exists(legacy_db, table), f"{table} survived an interrupted apply"
+
+    _apply(legacy_db, ITEMS)                            # the restart
+    for table in ITEM_TABLES:
+        assert _table_exists(legacy_db, table), f"{table} missing after a clean re-apply"
+
+
+def test_0013_forces_rls_with_policies_and_grants_no_delete(legacy_db):
+    _migrate(legacy_db)
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        for table in ITEM_TABLES:
+            rls = conn.execute(
+                "select relrowsecurity, relforcerowsecurity from pg_class c"
+                " join pg_namespace n on n.oid = c.relnamespace"
+                " where n.nspname = 'blocks' and c.relname = %s", (table,)).fetchone()
+            assert rls["relrowsecurity"] and rls["relforcerowsecurity"], f"{table}: RLS not forced"
+
+            policies = conn.execute(
+                "select count(*) as n from pg_policies"
+                " where schemaname = 'blocks' and tablename = %s", (table,)).fetchone()["n"]
+            assert policies >= 1, f"{table}: no tenant policy"
+
+            # has_table_privilege, not information_schema.role_table_grants: the
+            # latter only lists grants visible to the QUERYING role, so from
+            # blocks_backup it returned an empty set -- and "DELETE not in set()"
+            # passed without checking anything. The positive assertion below is
+            # what exposed that; it is kept so a blind query cannot pass again.
+            def can(priv, _table=table):
+                return conn.execute(
+                    "select has_table_privilege('blocks_app', %s, %s) as ok",
+                    (f"blocks.{_table}", priv)).fetchone()["ok"]
+
+            assert can("SELECT") and can("INSERT"), f"{table}: runtime role cannot read/write"
+            assert not can("DELETE"), f"{table}: DELETE granted — a tombstone could be removed"
+
+        def receipts_can(priv):
+            return conn.execute(
+                "select has_table_privilege('blocks_app', 'blocks.project_item_operations', %s)"
+                " as ok", (priv,)).fetchone()["ok"]
+
+        assert not receipts_can("UPDATE"), "a recorded operation receipt must be append-only"
+
+
+def test_0013_refuses_an_item_referencing_another_tenants_project(legacy_db):
+    """Tenant-composite references hold even if application validation is bypassed."""
+    _migrate(legacy_db)
+    mine, theirs = _new_tenant(legacy_db, "mine"), _new_tenant(legacy_db, "theirs")
+    their_project = _project_with_singleton(legacy_db, theirs, "Theirs", "")
+
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (mine,))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute(
+                "insert into blocks.project_note_items"
+                " (tenant_id, id, project_id, body, creation_fingerprint, last_operation_id)"
+                " values (%s, gen_random_uuid(), %s, 'x', '\\x00', gen_random_uuid())",
+                (mine, their_project))
+
+
+def test_0013_allows_one_key_per_project_and_one_project_per_key(legacy_db):
+    _migrate(legacy_db)
+    tenant = _new_tenant(legacy_db, "aliases")
+    a = _project_with_singleton(legacy_db, tenant, "A", "")
+    b = _project_with_singleton(legacy_db, tenant, "B", "")
+
+    def attach(project, key):
+        with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+            conn.execute("set role blocks_owner")
+            conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+            conn.execute(
+                "insert into blocks.project_navigation_aliases"
+                " (tenant_id, project_key, project_id) values (%s, %s, %s)",
+                (tenant, key, project))
+            conn.commit()
+
+    import uuid as _uuid
+    key = str(_uuid.uuid4())
+    attach(a, key)
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        attach(a, str(_uuid.uuid4()))                  # a second key for A
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        attach(b, key)                                  # A's key for B

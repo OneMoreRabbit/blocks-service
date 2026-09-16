@@ -36,9 +36,16 @@ class ResourceIdentityConflict(ConcurrencyConflict):
     client must mint a new id or reconcile against the resource that exists.
     """
 
+#: `navigation_key` is a correlated subquery rather than a join so the same column
+#: list serves plain reads AND the `returning` clauses of mutations. A rename or
+#: archive response must not report `null` while a key exists -- a client that
+#: trusted it would believe its printed link had been removed. The subquery runs
+#: under the tenant's policy, so it can only ever find this tenant's key.
 PROJECT_COLUMNS = (
     "id, tenant_id, client_id, name, status::text as status, row_version,"
-    " created_at, updated_at, archived_at"
+    " created_at, updated_at, archived_at,"
+    " (select a.project_key from blocks.project_navigation_aliases a"
+    "   where a.project_id = projects.id) as navigation_key"
 )
 
 
