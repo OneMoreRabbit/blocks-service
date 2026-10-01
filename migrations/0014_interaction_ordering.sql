@@ -63,6 +63,15 @@ create table blocks.link_order_aggregates (
   constraint link_order_version_positive check (version >= 1)
 );
 
+-- A Link-order member is one specific Link in one specific Project. The
+-- tenant/id primary key alone cannot be the target of that three-part fact: a
+-- same-tenant Link from Project A would otherwise satisfy a separate Link FK
+-- while the order row named Project B. This redundant candidate key exists so
+-- the position can bind all three identities in one declarative constraint.
+alter table blocks.project_resource_links
+  add constraint project_resource_links_tenant_project_id_key
+  unique (tenant_id, project_id, id);
+
 create table blocks.link_order_positions (
   tenant_id   uuid   not null,
   project_id  uuid   not null,
@@ -71,9 +80,9 @@ create table blocks.link_order_positions (
   primary key (tenant_id, project_id, link_id),
   unique (tenant_id, project_id, position),
   foreign key (tenant_id, project_id)
-    references blocks.projects (tenant_id, id) on delete cascade,
-  foreign key (tenant_id, link_id)
-    references blocks.project_resource_links (tenant_id, id) on delete cascade,
+    references blocks.link_order_aggregates (tenant_id, project_id) on delete cascade,
+  foreign key (tenant_id, project_id, link_id)
+    references blocks.project_resource_links (tenant_id, project_id, id) on delete cascade,
   constraint link_order_position_positive check (position >= 1)
 );
 

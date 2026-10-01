@@ -43,7 +43,8 @@ async def _project(client, auth, tenant, name="Kitchen", who="alice") -> dict:
 async def _link(client, auth, tenant, project, title="Link", who="alice") -> dict:
     link_id = str(uuid.uuid4())
     response = await client.post(
-        f"/v1/tenants/{tenant}/projects/{project}/items/links", headers=auth(who),
+        f"/v1/tenants/{tenant}/projects/{project}/items/links",
+        headers={**auth(who), "X-Blocks-API-Version": "0.7"},
         json={"id": link_id, "title": title, "uri": "https://example.com/",
               "operation_id": str(uuid.uuid4())},
     )
@@ -58,7 +59,7 @@ async def test_v03_uri_corpus_has_handler_and_database_parity(client, auth, db: 
 
     def handler_accepts(value: str) -> bool:
         try:
-            validate_uri(value)
+            validate_uri(value, api_version="0.7")
             return True
         except InvalidItem:
             return False

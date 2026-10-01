@@ -15,10 +15,10 @@ CORPUS = json.loads(
 
 @pytest.mark.parametrize("uri", CORPUS["accepted"])
 def test_shared_v03_accepted_uri(uri):
-    assert validate_uri(uri) == uri
+    assert validate_uri(uri, api_version="0.7") == uri
 
 
 @pytest.mark.parametrize("uri", CORPUS["refused"])
 def test_shared_v03_refused_uri(uri):
     with pytest.raises(InvalidItem):
-        validate_uri(uri)
+        validate_uri(uri, api_version="0.7")

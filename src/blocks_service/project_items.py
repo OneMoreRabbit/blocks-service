@@ -31,7 +31,8 @@ import psycopg
 from . import events
 from .operating_loop import ConcurrencyConflict, DomainError, NotFound
 
-ALLOWED_SCHEMES = ("http", "https", "obsidian", "onenote")
+API_06_ALLOWED_SCHEMES = ("http", "https", "obsidian")
+API_07_ALLOWED_SCHEMES = (*API_06_ALLOWED_SCHEMES, "onenote")
 NOTE_BODY_MAX = 100_000
 LINK_TITLE_MAX = 200
 
@@ -119,18 +120,29 @@ _OBSIDIAN = (
 _ONENOTE = "[Oo][Nn][Ee][Nn][Oo][Tt][Ee]:[!-~]+"
 _ONENOTE_CREDENTIALS = re.compile(r"^onenote://[^/?#]*@", re.IGNORECASE)
 
-#: The complete link-URI rule. Migration 0013 must carry exactly this string.
+#: API 0.6's accepted rule normalizes surrounding whitespace before evaluating
+#: this pattern. Migration 0013 carries this HTTP/Obsidian expression.
+LINK_URI_V06_PATTERN = f"^({_HTTP}|{_OBSIDIAN})$"
+_LINK_URI_V06 = re.compile(LINK_URI_V06_PATTERN)
+
+#: API 0.7 evaluates the supplied value unchanged and adds ordinary OneNote.
+#: Migration 0014 combines the installed 0013 rule with the OneNote branch.
 LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN}|{_ONENOTE})$"
-_LINK_URI = re.compile(LINK_URI_PATTERN)
+_LINK_URI_V07 = re.compile(LINK_URI_PATTERN)
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
-def validate_uri(raw: str) -> str:
-    """Accept a logical link URI, or refuse it. Never resolve, fetch or launch it.
+def validate_uri(raw: str, *, api_version: str) -> str:
+    """Validate for an explicitly selected Link contract version.
 
-    The ACCEPT/REFUSE decision applies to the supplied value unchanged. The
-    database evaluates the same HTTP/Obsidian expression plus the same ordinary
-    OneNote safe-input branch:
+    API 0.6 preserves its accepted normalization: surrounding whitespace is
+    stripped before the HTTP/HTTPS/Obsidian rule is evaluated, and the normalized
+    value is stored and returned. API 0.7 applies the supplied value unchanged,
+    refuses all raw whitespace, and adds ordinary OneNote URIs. The request edge
+    selects the version; this function deliberately has no unidentified default.
+
+    The API 0.7/database decision uses the same HTTP/Obsidian expression plus the
+    same ordinary OneNote safe-input branch:
 
     * the scheme is `http`, `https`, `obsidian` or `onenote`, in any case;
     * printable ASCII only -- no control characters, whitespace or raw non-ASCII
@@ -142,14 +154,24 @@ def validate_uri(raw: str) -> str:
     The refusal messages only explain which part failed; they never change the
     decision, and they never echo the value.
     """
-    uri = raw
-    if _LINK_URI.fullmatch(uri) and not _ONENOTE_CREDENTIALS.match(uri):
+    if api_version == "0.6":
+        uri = raw.strip()
+        pattern = _LINK_URI_V06
+        allowed_schemes = API_06_ALLOWED_SCHEMES
+    elif api_version == "0.7":
+        uri = raw
+        pattern = _LINK_URI_V07
+        allowed_schemes = API_07_ALLOWED_SCHEMES
+    else:
+        raise ValueError(f"unsupported Link API version: {api_version}")
+
+    if pattern.fullmatch(uri) and not _ONENOTE_CREDENTIALS.match(uri):
         return uri
     if not uri:
         raise InvalidItem("uri must not be empty")
     scheme = _SCHEME.match(uri)
-    if not scheme or scheme.group(1).lower() not in ALLOWED_SCHEMES:
-        raise InvalidItem("uri scheme must be one of " + ", ".join(ALLOWED_SCHEMES))
+    if not scheme or scheme.group(1).lower() not in allowed_schemes:
+        raise InvalidItem("uri scheme must be one of " + ", ".join(allowed_schemes))
     raise InvalidItem("uri is not well formed: it needs a valid host or destination, "
                       "printable ASCII only, and no user-info")
 

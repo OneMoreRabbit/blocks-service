@@ -13,9 +13,10 @@ delete, bound to the complete envelope, for the life of the item.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Header, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -83,6 +84,23 @@ class LinkAck(LinkOut):
 
 NON_BLANK = r"\S"
 
+LinkApiVersion = Literal["0.6", "0.7"]
+
+
+def link_api_version(
+    x_blocks_api_version: LinkApiVersion | None = Header(
+        None,
+        alias="X-Blocks-API-Version",
+        description=(
+            "Link create/edit contract. Absent or `0.6` preserves API 0.6 surrounding-"
+            "whitespace normalization and its HTTP/HTTPS/Obsidian schemes. Explicit `0.7` "
+            "uses the strict no-whitespace v0.3 URI corpus and permits ordinary OneNote URIs."
+        ),
+    ),
+) -> LinkApiVersion:
+    """Choose Link URI semantics at the request edge without breaking 0.6 clients."""
+    return x_blocks_api_version or "0.6"
+
 
 class NoteCreateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -114,11 +132,10 @@ class LinkCreateIn(BaseModel):
     title: str = Field(min_length=1, max_length=items.LINK_TITLE_MAX, pattern=NON_BLANK)
     uri: str = Field(
         description=(
-            "An absolute `http`, `https`, `obsidian` or `onenote` URI. The scheme is compared "
-            "case-insensitively and preserved as written. `http`/`https` require a "
-            "well-formed authority with a valid host and no user-info; `obsidian` "
-            "requires a destination. Whitespace is refused. Service never "
-            "resolves, fetches or launches the value."
+            "A versioned absolute Link URI. With `X-Blocks-API-Version: 0.7`, the scheme may "
+            "be `http`, `https`, `obsidian` or `onenote` and raw whitespace is refused. "
+            "Absent or `0.6` preserves API 0.6 normalization and its original three schemes. "
+            "Service never resolves, fetches or launches the value."
         )
     )
     operation_id: UUID = OPERATION_ID
@@ -274,9 +291,10 @@ async def delete_note(project_id: UUID, item_id: UUID, body: DeleteIn,
              response_model=LinkAck, responses=MUTATION_ERRORS, summary="Create a resource link")
 async def create_link(
     project_id: UUID, body: LinkCreateIn, ctx: TenantContext = Depends(tenant_context),
+    api_version: LinkApiVersion = Depends(link_api_version),
 ) -> JSONResponse:
     try:
-        uri = items.validate_uri(body.uri)
+        uri = items.validate_uri(body.uri, api_version=api_version)
         row, replayed = await items.create_item(
             ctx.conn, ctx.tenant_id, project_id, "link",
             item_id=body.id, operation_id=body.operation_id,
@@ -311,9 +329,10 @@ async def read_link(
               responses=MUTATION_ERRORS, summary="Edit a link title and URI")
 async def edit_link(project_id: UUID, item_id: UUID, body: LinkEditIn,
                     ctx: TenantContext = Depends(tenant_context),
-                    version: int = Depends(if_match_version)) -> JSONResponse:
+                    version: int = Depends(if_match_version),
+                    api_version: LinkApiVersion = Depends(link_api_version)) -> JSONResponse:
     try:
-        uri = items.validate_uri(body.uri)
+        uri = items.validate_uri(body.uri, api_version=api_version)
         row, replayed = await items.mutate_item(
             ctx.conn, ctx.tenant_id, project_id, "link", item_id,
             mutation="edit", if_match=version, operation_id=body.operation_id,

@@ -1286,3 +1286,57 @@ def test_0014_forces_tenant_rls_and_keeps_receipts_append_only(legacy_db):
             "select has_table_privilege('blocks_app',"
             " 'blocks.interaction_operations', 'DELETE') as ok"
         ).fetchone()["ok"]
+
+
+def test_0014_structurally_rejects_a_same_tenant_wrong_project_link(legacy_db):
+    """The handler is not the boundary: the persisted membership is composite."""
+    _migrate(legacy_db)
+    tenant = _new_tenant(legacy_db, "project-scoped-link-order")
+    project_a = _project_with_singleton(legacy_db, tenant, "A", "")
+    project_b = _project_with_singleton(legacy_db, tenant, "B", "")
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        link_ids = []
+        for project, title in ((project_a, "A link"), (project_b, "B link")):
+            link_ids.append(conn.execute(
+                "insert into blocks.project_resource_links"
+                " (tenant_id, id, project_id, title, uri, creation_fingerprint,"
+                "  last_operation_id)"
+                " values (%s, gen_random_uuid(), %s, %s, 'https://example.com/',"
+                " decode('00', 'hex'), gen_random_uuid()) returning id::text as id",
+                (tenant, project, title),
+            ).fetchone()["id"])
+        conn.commit()
+
+    def positions():
+        with psycopg.connect(
+            _backup_dsn(legacy_db), row_factory=dict_row, autocommit=True
+        ) as conn:
+            return conn.execute(
+                "select project_id::text as project_id, link_id::text as link_id, position"
+                " from blocks.link_order_positions where tenant_id = %s"
+                " order by project_id, position",
+                (tenant,),
+            ).fetchall()
+
+    before = positions()
+    assert len(before) == 2
+
+    from tests.conftest import APP_PASSWORD
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    app_dsn = (
+        f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname={legacy_db}"
+    )
+    with psycopg.connect(app_dsn, autocommit=True) as conn:
+        conn.execute("select set_config('blocks.tenant_id', %s, false)", (tenant,))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as refused:
+            conn.execute(
+                "insert into blocks.link_order_positions"
+                " (tenant_id, project_id, link_id, position) values (%s, %s, %s, 2)",
+                (tenant, project_b, link_ids[0]),
+            )
+    assert refused.value.diag.constraint_name == "link_order_positions_tenant_id_project_id_link_id_fkey"
+    assert positions() == before, "either Project order changed after the refused direct insert"
