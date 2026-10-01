@@ -9,6 +9,7 @@ sessions and parking, and then migrates it.
 from __future__ import annotations
 
 import pathlib
+import os
 from collections.abc import Iterator
 
 import psycopg
@@ -72,6 +73,22 @@ def legacy_db() -> Iterator[str]:
             conn.execute(migration.read_text())
         _seed(conn)
     yield SCRATCH
+    # A current-image cutover case opens the application pool against this
+    # database. If a failed request leaves one blocks_app backend behind, the
+    # non-superuser harness cannot force-drop it. Ask blocks_app to terminate its
+    # own leftovers first, as the main test-database fixture does.
+    from tests.conftest import APP_PASSWORD
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    with psycopg.connect(
+        f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname={SCRATCH}",
+        autocommit=True,
+    ) as conn:
+        conn.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity"
+            " where datname = %s and usename = current_user and pid <> pg_backend_pid()",
+            (SCRATCH,),
+        )
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute(f'drop database if exists "{SCRATCH}" with (force)')
 
