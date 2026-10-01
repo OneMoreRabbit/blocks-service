@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-order_changed-v0_1.schema.json",
+  "title": "project.order_changed 0.1",
+  "description": "The active-Project custom order changed. Identifier-only; clients read the aggregate for its sequence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["aggregateId", "version", "operationId"],
+  "properties": {
+    "aggregateId": {"type": "string", "format": "uuid"},
+    "version": {"type": "integer", "minimum": 1},
+    "operationId": {"type": "string", "format": "uuid"}
+  }
+}

@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from blocks_service.app import create_app  # noqa: E402
 from blocks_service.config import Settings  # noqa: E402
 
-API_VERSION = "0.6"
+API_VERSION = "0.7"
 
 
 def main() -> int:
@@ -90,6 +90,9 @@ def main() -> int:
     for schema in sorted((ROOT / "contracts" / "events").glob("*.schema.json")):
         shutil.copy2(schema, args.out / schema.name)
         print(f"  wrote  {schema.name}")
+    for example in sorted((ROOT / "contracts" / "examples").glob("*.json")):
+        shutil.copy2(example, args.out / example.name)
+        print(f"  wrote  {example.name}")
     return 0
 
 

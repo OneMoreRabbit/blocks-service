@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-parking_deleted-v0_1.schema.json",
+  "title": "project.parking_deleted 0.1",
+  "description": "A Park record became hidden through a tombstone. Identifier-only; authored Park content is excluded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["projectId", "parkingRecordId", "version", "operationId"],
+  "properties": {
+    "projectId": {"type": "string", "format": "uuid"},
+    "parkingRecordId": {"type": "string", "format": "uuid"},
+    "version": {"type": "integer", "minimum": 1},
+    "operationId": {"type": "string", "format": "uuid"}
+  }
+}

@@ -114,10 +114,10 @@ class LinkCreateIn(BaseModel):
     title: str = Field(min_length=1, max_length=items.LINK_TITLE_MAX, pattern=NON_BLANK)
     uri: str = Field(
         description=(
-            "An absolute `http`, `https` or `obsidian` URI. The scheme is compared "
+            "An absolute `http`, `https`, `obsidian` or `onenote` URI. The scheme is compared "
             "case-insensitively and preserved as written. `http`/`https` require a "
             "well-formed authority with a valid host and no user-info; `obsidian` "
-            "requires a destination. Surrounding whitespace is trimmed. Service never "
+            "requires a destination. Whitespace is refused. Service never "
             "resolves, fetches or launches the value."
         )
     )

@@ -171,6 +171,9 @@ class ProjectParkingOut(BaseModel):
     device_id: UUID | None
     supersedes_id: UUID | None
     created_at: datetime
+    row_version: int = 1
+    deleted_at: datetime | None = None
+    last_operation_id: UUID | None = None
 
 
 class ProjectPageOut(BaseModel):

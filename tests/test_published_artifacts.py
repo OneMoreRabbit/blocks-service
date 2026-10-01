@@ -27,12 +27,13 @@ CONTRACTS = (
     "blocks-service-api-contract-v0_4.md",
     "blocks-service-api-contract-v0_5.md",
     "blocks-service-api-contract-v0_6.md",
+    "blocks-service-api-contract-v0_7.md",
 )
 
 #: The version the service currently generates. Older published contracts are
 #: immutable: their artefacts are the bytes consumers were handed, and a stale
 #: comparison against the live app would be asserting that history should change.
-CURRENT = "0_6"
+CURRENT = "0_7"
 
 pytestmark = pytest.mark.skipif(
     not PROVIDES.is_dir(), reason="vault clone not present; run scripts/atlas-context.sh"

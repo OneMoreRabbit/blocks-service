@@ -31,7 +31,7 @@ import psycopg
 from . import events
 from .operating_loop import ConcurrencyConflict, DomainError, NotFound
 
-ALLOWED_SCHEMES = ("http", "https", "obsidian")
+ALLOWED_SCHEMES = ("http", "https", "obsidian", "onenote")
 NOTE_BODY_MAX = 100_000
 LINK_TITLE_MAX = 200
 
@@ -116,9 +116,11 @@ _OBSIDIAN = (
     f"|/?[?]?{_DESTINATION_CHAR}{_VISIBLE}*"               # obsidian:open
     ")"
 )
+_ONENOTE = "[Oo][Nn][Ee][Nn][Oo][Tt][Ee]:[!-~]+"
+_ONENOTE_CREDENTIALS = re.compile(r"^onenote://[^/?#]*@", re.IGNORECASE)
 
 #: The complete link-URI rule. Migration 0013 must carry exactly this string.
-LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN})$"
+LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN}|{_ONENOTE})$"
 _LINK_URI = re.compile(LINK_URI_PATTERN)
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
@@ -126,22 +128,22 @@ _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 def validate_uri(raw: str) -> str:
     """Accept a logical link URI, or refuse it. Never resolve, fetch or launch it.
 
-    Surrounding whitespace is trimmed and the trimmed value is what is stored and
-    returned; the ACCEPT/REFUSE decision is then exactly LINK_URI_PATTERN, the
-    same expression the database constraint evaluates:
+    The ACCEPT/REFUSE decision applies to the supplied value unchanged. The
+    database evaluates the same HTTP/Obsidian expression plus the same ordinary
+    OneNote safe-input branch:
 
-    * the scheme is `http`, `https` or `obsidian`, in any case, preserved as sent;
+    * the scheme is `http`, `https`, `obsidian` or `onenote`, in any case;
     * printable ASCII only -- no control characters, whitespace or raw non-ASCII
       (RFC 3986: an IRI is sent percent-encoded);
     * `http`/`https` need an authority whose host is a DNS name, an IPv4 address or
       a bracketed IPv6 literal, an optional port 1-65535, and no user-info;
-    * `obsidian` needs a non-empty destination, and no user-info in an authority.
+    * application schemes need a non-empty destination and no credentials.
 
     The refusal messages only explain which part failed; they never change the
     decision, and they never echo the value.
     """
-    uri = raw.strip()
-    if _LINK_URI.fullmatch(uri):
+    uri = raw
+    if _LINK_URI.fullmatch(uri) and not _ONENOTE_CREDENTIALS.match(uri):
         return uri
     if not uri:
         raise InvalidItem("uri must not be empty")
@@ -421,12 +423,21 @@ async def list_items(
     if not await _project_visible(conn, project_id):
         raise NotFound("no such project in this tenant")
     table, columns = _table(kind)
-    order = ("pinned desc, created_at desc, id desc" if kind == "note"
-             else "created_at desc, id desc")
-    cur = await conn.execute(
-        f"select {columns} from {table} where project_id = %s order by {order}",
-        (project_id,),
-    )
+    if kind == "note":
+        cur = await conn.execute(
+            f"select {columns} from {table} where project_id = %s"
+            " order by pinned desc, created_at desc, id desc", (project_id,)
+        )
+    else:
+        cur = await conn.execute(
+            "select l.tenant_id, l.id, l.project_id, l.title, l.uri, l.created_at,"
+            " l.updated_at, l.row_version, l.deleted_at, l.last_operation_id"
+            f" from {table} l"
+            " left join blocks.link_order_positions o"
+            "   on o.tenant_id = l.tenant_id and o.project_id = l.project_id and o.link_id = l.id"
+            " where l.project_id = %s"
+            " order by o.position nulls last, l.created_at, l.id", (project_id,)
+        )
     return list(await cur.fetchall())
 
 
