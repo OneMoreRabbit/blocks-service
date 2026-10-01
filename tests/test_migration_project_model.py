@@ -9,6 +9,7 @@ sessions and parking, and then migrates it.
 from __future__ import annotations
 
 import pathlib
+import os
 from collections.abc import Iterator
 
 import psycopg
@@ -20,7 +21,7 @@ from psycopg.rows import dict_row
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
 EXPAND = [m for m in MIGRATIONS
-          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012", "0013"))]
+          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
@@ -28,6 +29,7 @@ SCOPED = EXPAND[3]        # 0010 — tenant-scoped client identity
 RESERVE = EXPAND[4]       # 0011 — idempotency reservation
 BLOCKID = EXPAND[5]       # 0012 — client-generated block identity
 ITEMS = EXPAND[6]         # 0013 — discrete project items
+INTERACTION = EXPAND[7]   # 0014 — ordered aggregates and Park tombstones
 SCRATCH = "blocks_migration_drill"
 
 
@@ -71,6 +73,22 @@ def legacy_db() -> Iterator[str]:
             conn.execute(migration.read_text())
         _seed(conn)
     yield SCRATCH
+    # A current-image cutover case opens the application pool against this
+    # database. If a failed request leaves one blocks_app backend behind, the
+    # non-superuser harness cannot force-drop it. Ask blocks_app to terminate its
+    # own leftovers first, as the main test-database fixture does.
+    from tests.conftest import APP_PASSWORD
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    with psycopg.connect(
+        f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname={SCRATCH}",
+        autocommit=True,
+    ) as conn:
+        conn.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity"
+            " where datname = %s and usename = current_user and pid <> pg_backend_pid()",
+            (SCRATCH,),
+        )
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
         conn.execute(f'drop database if exists "{SCRATCH}" with (force)')
 
@@ -164,6 +182,7 @@ def _legacy_create_project(dbname: str, name: str) -> tuple[str, str]:
         tenant = conn.execute(
             "select tenant_id from blocks.projects limit 1"
         ).fetchone()["tenant_id"]
+        conn.execute("select set_config('blocks.tenant_id', %s, false)", (str(tenant),))
         row = conn.execute(
             "insert into blocks.projects (tenant_id, name) values (%s, %s)"
             " returning id, tenant_id",
@@ -493,9 +512,10 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
     _apply(legacy_db, RESERVE)                      # 0011
     _apply(legacy_db, BLOCKID)                      # 0012
     # 0013 as well: this test then runs the CURRENT application against the
-    # schema, and a 0.6 image requires 0013 (deployment 0.6, restore boundaries).
+    # schema, and the current image requires 0013 and 0014.
     # Project reads carry the navigation key, which lives in a 0013 table.
-    _apply(legacy_db, ITEMS)                        # 0013 completes the expand step
+    _apply(legacy_db, ITEMS)                        # 0013
+    _apply(legacy_db, INTERACTION)                  # 0014 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
@@ -1184,3 +1204,139 @@ def test_0013_allows_one_key_per_project_and_one_project_per_key(legacy_db):
         attach(a, str(_uuid.uuid4()))                  # a second key for A
     with pytest.raises(psycopg.errors.UniqueViolation):
         attach(b, key)                                  # A's key for B
+
+
+# --------------------------------------------------------------------------
+# 0014 — interaction ordering and Park tombstones (API 0.7)
+# --------------------------------------------------------------------------
+
+INTERACTION_TABLES = (
+    "project_order_aggregates", "project_order_positions",
+    "link_order_aggregates", "link_order_positions", "interaction_operations",
+)
+
+
+def test_0014_backfills_complete_orders_and_preserves_every_park_field(legacy_db):
+    for migration in EXPAND[:7]:                       # through 0013
+        _apply(legacy_db, migration)
+    before = _snapshot(legacy_db)
+
+    _apply(legacy_db, INTERACTION)
+
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        projects = conn.execute(
+            "select count(*) as n from blocks.projects where status = 'active'"
+        ).fetchone()["n"]
+        positions = conn.execute(
+            "select count(*) as n from blocks.project_order_positions"
+        ).fetchone()["n"]
+        aggregates = conn.execute(
+            "select count(*) as n from blocks.link_order_aggregates"
+        ).fetchone()["n"]
+        park_versions = conn.execute(
+            "select row_version, deleted_at, last_operation_id from blocks.parking_records"
+        ).fetchall()
+    assert positions == projects
+    assert aggregates == projects
+    assert all(row == {"row_version": 1, "deleted_at": None, "last_operation_id": None}
+               for row in park_versions)
+    assert _snapshot(legacy_db) == before, "authored Park identity/content/time changed"
+
+
+def test_an_interrupted_0014_rolls_back_and_restarts_cleanly(legacy_db):
+    for migration in EXPAND[:7]:
+        _apply(legacy_db, migration)
+    broken = INTERACTION.read_text() + "\nselect 1/0;\n"
+
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            conn.execute(broken)
+        conn.rollback()
+
+    for table in INTERACTION_TABLES:
+        assert not _table_exists(legacy_db, table), f"{table} survived an interrupted apply"
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        columns = conn.execute(
+            "select column_name from information_schema.columns"
+            " where table_schema = 'blocks' and table_name = 'parking_records'"
+        ).fetchall()
+    assert "deleted_at" not in {row["column_name"] for row in columns}
+
+    _apply(legacy_db, INTERACTION)
+    for table in INTERACTION_TABLES:
+        assert _table_exists(legacy_db, table), f"{table} missing after clean re-apply"
+
+
+def test_0014_forces_tenant_rls_and_keeps_receipts_append_only(legacy_db):
+    _migrate(legacy_db)
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        for table in INTERACTION_TABLES:
+            state = conn.execute(
+                "select relrowsecurity, relforcerowsecurity from pg_class c"
+                " join pg_namespace n on n.oid = c.relnamespace"
+                " where n.nspname = 'blocks' and c.relname = %s", (table,)
+            ).fetchone()
+            assert state["relrowsecurity"] and state["relforcerowsecurity"]
+        assert not conn.execute(
+            "select has_table_privilege('blocks_app',"
+            " 'blocks.interaction_operations', 'UPDATE') as ok"
+        ).fetchone()["ok"]
+        assert not conn.execute(
+            "select has_table_privilege('blocks_app',"
+            " 'blocks.interaction_operations', 'DELETE') as ok"
+        ).fetchone()["ok"]
+
+
+def test_0014_structurally_rejects_a_same_tenant_wrong_project_link(legacy_db):
+    """The handler is not the boundary: the persisted membership is composite."""
+    _migrate(legacy_db)
+    tenant = _new_tenant(legacy_db, "project-scoped-link-order")
+    project_a = _project_with_singleton(legacy_db, tenant, "A", "")
+    project_b = _project_with_singleton(legacy_db, tenant, "B", "")
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        link_ids = []
+        for project, title in ((project_a, "A link"), (project_b, "B link")):
+            link_ids.append(conn.execute(
+                "insert into blocks.project_resource_links"
+                " (tenant_id, id, project_id, title, uri, creation_fingerprint,"
+                "  last_operation_id)"
+                " values (%s, gen_random_uuid(), %s, %s, 'https://example.com/',"
+                " decode('00', 'hex'), gen_random_uuid()) returning id::text as id",
+                (tenant, project, title),
+            ).fetchone()["id"])
+        conn.commit()
+
+    def positions():
+        with psycopg.connect(
+            _backup_dsn(legacy_db), row_factory=dict_row, autocommit=True
+        ) as conn:
+            return conn.execute(
+                "select project_id::text as project_id, link_id::text as link_id, position"
+                " from blocks.link_order_positions where tenant_id = %s"
+                " order by project_id, position",
+                (tenant,),
+            ).fetchall()
+
+    before = positions()
+    assert len(before) == 2
+
+    from tests.conftest import APP_PASSWORD
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    app_dsn = (
+        f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname={legacy_db}"
+    )
+    with psycopg.connect(app_dsn, autocommit=True) as conn:
+        conn.execute("select set_config('blocks.tenant_id', %s, false)", (tenant,))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as refused:
+            conn.execute(
+                "insert into blocks.link_order_positions"
+                " (tenant_id, project_id, link_id, position) values (%s, %s, %s, 2)",
+                (tenant, project_b, link_ids[0]),
+            )
+    assert refused.value.diag.constraint_name == "link_order_positions_tenant_id_project_id_link_id_fkey"
+    assert positions() == before, "either Project order changed after the refused direct insert"

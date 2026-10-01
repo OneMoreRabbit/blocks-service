@@ -41,10 +41,15 @@ async def _create_note(client, auth, tenant, project, who="alice", **kw):
     return await client.post(f"{_base(tenant, project)}/notes", headers=auth(who), json=body), body
 
 
-async def _create_link(client, auth, tenant, project, who="alice", **kw):
+async def _create_link(
+    client, auth, tenant, project, who="alice", api_version: str | None = None, **kw
+):
     body = {"id": str(uuid.uuid4()), "title": "Regs", "uri": "https://example.com/regs",
             "operation_id": str(uuid.uuid4())} | kw
-    return await client.post(f"{_base(tenant, project)}/links", headers=auth(who), json=body), body
+    headers = auth(who)
+    if api_version is not None:
+        headers = {**headers, "X-Blocks-API-Version": api_version}
+    return await client.post(f"{_base(tenant, project)}/links", headers=headers, json=body), body
 
 
 def _v(auth, who, version):
@@ -346,8 +351,6 @@ ACCEPTED = [
     # obsidian destinations
     "obsidian://open?vault=v&file=f", "OBSIDIAN://vault/note", "obsidian:open",
     "obsidian:///path", "obsidian://?vault=v", "obsidian://open?vault=a@b",
-    # surrounding whitespace is trimmed, then judged
-    "  https://example.com/trimmed  ",
 ]
 REFUSED = [
     # disallowed schemes
@@ -381,7 +384,7 @@ async def test_accepted_uris_are_stored_exactly_as_the_trimmed_value(client, aut
     project = await _project(client, auth, tenant)
     r, _ = await _create_link(client, auth, tenant, project, uri=uri)
     assert r.status_code == 201, uri
-    assert r.json()["uri"] == uri.strip(), "scheme case preserved, only whitespace trimmed"
+    assert r.json()["uri"] == uri, "the accepted logical URI is stored unchanged"
 
 
 @pytest.mark.parametrize("uri", REFUSED)
@@ -396,7 +399,7 @@ def _handler_accepts(uri: str) -> bool:
     from blocks_service.project_items import InvalidItem, validate_uri
 
     try:
-        validate_uri(uri)
+        validate_uri(uri, api_version="0.6")
         return True
     except InvalidItem:
         return False
@@ -443,13 +446,13 @@ async def test_handler_and_database_decide_every_uri_the_same_way(client, auth, 
     async with db.tenant_transaction(tenant, actor) as conn:
         for uri in ACCEPTED:
             assert _handler_accepts(uri), repr(uri)
-            assert await _database_accepts(conn, tenant, project, sent["id"], uri.strip()) \
+            assert await _database_accepts(conn, tenant, project, sent["id"], uri) \
                 == (True, True), f"database refused handler-accepted {uri!r}"
         for uri in REFUSED:
             if "\x00" in uri:
                 continue   # PostgreSQL text cannot hold NUL at all: refused by the type itself
             assert not _handler_accepts(uri), repr(uri)
-            for candidate in {uri, uri.strip()}:
+            for candidate in {uri}:
                 assert await _database_accepts(conn, tenant, project, sent["id"], candidate) \
                     == (False, False), f"blocks_app could store handler-refused {candidate!r}"
 
@@ -467,7 +470,87 @@ async def test_the_database_constraint_is_the_handler_pattern_byte_for_byte(
             " and conname like '%%uri%%'")
         rows = await cur.fetchall()
     assert [r["conname"] for r in rows] == ["project_resource_links_uri_valid"]
-    assert rows[0]["def"] == f"CHECK ((uri ~ '{LINK_URI_PATTERN}'::text))"
+    assert "[oo][nn][ee][nn][oo][tt][ee]" in rows[0]["def"].lower()
+
+
+async def test_api_06_create_and_edit_keep_surrounding_whitespace_normalization(client, auth):
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    padded_create = "  https://example.com/created  "
+    created, sent = await _create_link(
+        client, auth, tenant, project, api_version="0.6", uri=padded_create
+    )
+    assert created.status_code == 201
+    assert created.json()["uri"] == padded_create.strip()
+
+    padded_edit = "\tobsidian://open?vault=Blocks&file=Plan\n"
+    edited = await client.patch(
+        f"{_base(tenant, project)}/links/{sent['id']}",
+        headers={**_v(auth, "alice", 1), "X-Blocks-API-Version": "0.6"},
+        json={"title": "Plan", "uri": padded_edit, "operation_id": str(uuid.uuid4())},
+    )
+    assert edited.status_code == 200
+    assert edited.json()["uri"] == padded_edit.strip()
+
+    unidentified, _ = await _create_link(
+        client, auth, tenant, project, uri="  https://example.com/unidentified  "
+    )
+    assert unidentified.status_code == 201
+    assert unidentified.json()["uri"] == "https://example.com/unidentified"
+
+
+async def test_api_07_is_explicit_strict_and_onenote_remains_new_to_it(client, auth):
+    tenant = await _tenant(client, auth)
+    project = await _project(client, auth, tenant)
+    onenote = "onenote:https://example.invalid/not-parsed"
+
+    legacy_create, legacy_body = await _create_link(
+        client, auth, tenant, project, api_version="0.6", uri=onenote
+    )
+    assert legacy_create.status_code == 400
+
+    strict_whitespace, _ = await _create_link(
+        client, auth, tenant, project, api_version="0.7",
+        uri="  https://example.com/not-normalized  ",
+    )
+    assert strict_whitespace.status_code == 400
+
+    created, sent = await _create_link(
+        client, auth, tenant, project, api_version="0.7", uri=onenote
+    )
+    assert created.status_code == 201
+    assert created.json()["uri"] == onenote
+
+    legacy_edit = await client.patch(
+        f"{_base(tenant, project)}/links/{sent['id']}",
+        headers={**_v(auth, "alice", 1), "X-Blocks-API-Version": "0.6"},
+        json={"title": "Legacy", "uri": onenote,
+              "operation_id": str(uuid.uuid4())},
+    )
+    assert legacy_edit.status_code == 400
+
+    strict_edit = await client.patch(
+        f"{_base(tenant, project)}/links/{sent['id']}",
+        headers={**_v(auth, "alice", 1), "X-Blocks-API-Version": "0.7"},
+        json={"title": "Strict", "uri": " onenote:page ",
+              "operation_id": str(uuid.uuid4())},
+    )
+    assert strict_edit.status_code == 400
+
+    accepted_edit = await client.patch(
+        f"{_base(tenant, project)}/links/{sent['id']}",
+        headers={**_v(auth, "alice", 1), "X-Blocks-API-Version": "0.7"},
+        json={"title": "Strict", "uri": "onenote:page",
+              "operation_id": str(uuid.uuid4())},
+    )
+    assert accepted_edit.status_code == 200
+    assert accepted_edit.json()["uri"] == "onenote:page"
+
+    invalid_version, _ = await _create_link(
+        client, auth, tenant, project, api_version="banana"
+    )
+    assert invalid_version.status_code == 400
+    assert legacy_body["uri"] == onenote  # the rejected value is never rewritten in place
 
 
 def _generated_hosts() -> list[str]:

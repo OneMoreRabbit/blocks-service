@@ -89,6 +89,15 @@ def test_contract_headers_are_declared_where_they_apply(spec):
         assert "Idempotency-Key" in by_op[op], op
         assert by_op[op]["Idempotency-Key"]["required"] is False, op
 
+    versioned_links = [
+        "POST /v1/tenants/{tenant_id}/projects/{project_id}/items/links",
+        "PATCH /v1/tenants/{tenant_id}/projects/{project_id}/items/links/{item_id}",
+    ]
+    for op in versioned_links:
+        header = by_op[op]["X-Blocks-API-Version"]
+        assert header["required"] is False, op
+        assert set(header["schema"]["anyOf"][0]["enum"]) == {"0.6", "0.7"}, op
+
 
 def test_idempotent_replay_is_declared_as_a_response_header(spec):
     """A replay is indistinguishable from a first response without it."""
@@ -127,7 +136,7 @@ def test_no_success_response_is_untyped_and_no_422_is_advertised(spec):
 
 
 def test_the_document_version_matches_the_contract(spec):
-    assert spec["info"]["version"] == "0.6.0"
+    assert spec["info"]["version"] == "0.7.0"
 
 
 # --------------------------------------------------------------------------

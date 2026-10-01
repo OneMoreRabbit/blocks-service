@@ -1,0 +1,66 @@
+{
+  "version": "0.7",
+  "operations": {
+    "REORDER_PROJECTS": {
+      "route": "PUT /v1/tenants/{tenant_id}/interaction/project-order",
+      "request": {
+        "operation_id": "10000000-0000-4000-8000-000000000001",
+        "aggregate_id": "20000000-0000-4000-8000-000000000001",
+        "base_version": 4,
+        "ordered_client_ids": [
+          "30000000-0000-4000-8000-000000000002",
+          "30000000-0000-4000-8000-000000000001"
+        ]
+      },
+      "result": {
+        "operation_id": "10000000-0000-4000-8000-000000000001",
+        "aggregate_id": "20000000-0000-4000-8000-000000000001",
+        "ordered_client_ids": [
+          "30000000-0000-4000-8000-000000000002",
+          "30000000-0000-4000-8000-000000000001"
+        ],
+        "version": 5
+      }
+    },
+    "REORDER_LINKS": {
+      "route": "PUT /v1/tenants/{tenant_id}/projects/{project_id}/interaction/link-order",
+      "request": {
+        "operation_id": "10000000-0000-4000-8000-000000000002",
+        "aggregate_id": "20000000-0000-4000-8000-000000000002",
+        "base_version": 7,
+        "ordered_client_ids": [
+          "40000000-0000-4000-8000-000000000002",
+          "40000000-0000-4000-8000-000000000001"
+        ]
+      },
+      "result": {
+        "operation_id": "10000000-0000-4000-8000-000000000002",
+        "aggregate_id": "20000000-0000-4000-8000-000000000002",
+        "project_id": "30000000-0000-4000-8000-000000000001",
+        "ordered_client_ids": [
+          "40000000-0000-4000-8000-000000000002",
+          "40000000-0000-4000-8000-000000000001"
+        ],
+        "version": 8
+      }
+    },
+    "DELETE_PARKING": {
+      "route": "POST /v1/tenants/{tenant_id}/projects/{project_id}/parking/{parking_id}/delete",
+      "request": {
+        "operation_id": "10000000-0000-4000-8000-000000000003",
+        "aggregate_id": "50000000-0000-4000-8000-000000000001",
+        "target_id": "50000000-0000-4000-8000-000000000001",
+        "base_version": 1
+      },
+      "result": {
+        "operation_id": "10000000-0000-4000-8000-000000000003",
+        "aggregate_id": "50000000-0000-4000-8000-000000000001",
+        "project_id": "30000000-0000-4000-8000-000000000001",
+        "target_id": "50000000-0000-4000-8000-000000000001",
+        "version": 2,
+        "deleted_at": "2026-10-01T10:30:00Z",
+        "changed": true
+      }
+    }
+  }
+}

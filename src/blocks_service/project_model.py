@@ -51,6 +51,19 @@ PROJECT_COLUMNS = (
 
 async def list_projects(conn: psycopg.AsyncConnection, status: str = "active") -> list[dict]:
     """The dashboard. Active by default; archived is a separate, deliberate ask."""
+    if status == "active":
+        cur = await conn.execute(
+            "select projects.id, projects.tenant_id, projects.client_id, projects.name,"
+            " projects.status::text as status, projects.row_version, projects.created_at,"
+            " projects.updated_at, projects.archived_at,"
+            " (select a.project_key from blocks.project_navigation_aliases a"
+            "   where a.project_id = projects.id) as navigation_key"
+            " from blocks.projects"
+            " join blocks.project_order_positions o"
+            "   on o.tenant_id = projects.tenant_id and o.project_id = projects.id"
+            " where status = 'active'::blocks.project_status order by o.position"
+        )
+        return list(await cur.fetchall())
     cur = await conn.execute(
         f"select {PROJECT_COLUMNS} from blocks.projects"
         " where status = %s::blocks.project_status order by created_at desc",
@@ -322,7 +335,8 @@ async def save_notes(
 
 PARKING_COLUMNS = (
     "id, client_id, project_id, where_i_am, next_physical_action, must_not_forget,"
-    " authored_by_user_id, device_id, supersedes_id, occurred_at, created_at"
+    " authored_by_user_id, device_id, supersedes_id, occurred_at, created_at,"
+    " row_version, deleted_at, last_operation_id"
 )
 
 #: Newest-first, total and deterministic (ADR-0011).
@@ -448,6 +462,7 @@ async def newest_parking(conn: psycopg.AsyncConnection, project_id: UUID) -> dic
     cur = await conn.execute(
         f"select {PARKING_COLUMNS} from blocks.parking_records p"
         " where p.project_id = %s"
+        "   and p.deleted_at is null"
         "   and not exists ("
         "     select 1 from blocks.parking_records s where s.supersedes_id = p.id"
         "   )"
@@ -466,7 +481,7 @@ async def parking_history(conn: psycopg.AsyncConnection, project_id: UUID) -> li
     """
     cur = await conn.execute(
         f"select {PARKING_COLUMNS} from blocks.parking_records"
-        f" where project_id = %s order by {AUTHORED_ORDER}",
+        f" where project_id = %s and deleted_at is null order by {AUTHORED_ORDER}",
         (project_id,),
     )
     return list(await cur.fetchall())

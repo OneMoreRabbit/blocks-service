@@ -31,7 +31,8 @@ import psycopg
 from . import events
 from .operating_loop import ConcurrencyConflict, DomainError, NotFound
 
-ALLOWED_SCHEMES = ("http", "https", "obsidian")
+API_06_ALLOWED_SCHEMES = ("http", "https", "obsidian")
+API_07_ALLOWED_SCHEMES = (*API_06_ALLOWED_SCHEMES, "onenote")
 NOTE_BODY_MAX = 100_000
 LINK_TITLE_MAX = 200
 
@@ -116,38 +117,61 @@ _OBSIDIAN = (
     f"|/?[?]?{_DESTINATION_CHAR}{_VISIBLE}*"               # obsidian:open
     ")"
 )
+_ONENOTE = "[Oo][Nn][Ee][Nn][Oo][Tt][Ee]:[!-~]+"
+_ONENOTE_CREDENTIALS = re.compile(r"^onenote://[^/?#]*@", re.IGNORECASE)
 
-#: The complete link-URI rule. Migration 0013 must carry exactly this string.
-LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN})$"
-_LINK_URI = re.compile(LINK_URI_PATTERN)
+#: API 0.6's accepted rule normalizes surrounding whitespace before evaluating
+#: this pattern. Migration 0013 carries this HTTP/Obsidian expression.
+LINK_URI_V06_PATTERN = f"^({_HTTP}|{_OBSIDIAN})$"
+_LINK_URI_V06 = re.compile(LINK_URI_V06_PATTERN)
+
+#: API 0.7 evaluates the supplied value unchanged and adds ordinary OneNote.
+#: Migration 0014 combines the installed 0013 rule with the OneNote branch.
+LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN}|{_ONENOTE})$"
+_LINK_URI_V07 = re.compile(LINK_URI_PATTERN)
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
-def validate_uri(raw: str) -> str:
-    """Accept a logical link URI, or refuse it. Never resolve, fetch or launch it.
+def validate_uri(raw: str, *, api_version: str) -> str:
+    """Validate for an explicitly selected Link contract version.
 
-    Surrounding whitespace is trimmed and the trimmed value is what is stored and
-    returned; the ACCEPT/REFUSE decision is then exactly LINK_URI_PATTERN, the
-    same expression the database constraint evaluates:
+    API 0.6 preserves its accepted normalization: surrounding whitespace is
+    stripped before the HTTP/HTTPS/Obsidian rule is evaluated, and the normalized
+    value is stored and returned. API 0.7 applies the supplied value unchanged,
+    refuses all raw whitespace, and adds ordinary OneNote URIs. The request edge
+    selects the version; this function deliberately has no unidentified default.
 
-    * the scheme is `http`, `https` or `obsidian`, in any case, preserved as sent;
+    The API 0.7/database decision uses the same HTTP/Obsidian expression plus the
+    same ordinary OneNote safe-input branch:
+
+    * the scheme is `http`, `https`, `obsidian` or `onenote`, in any case;
     * printable ASCII only -- no control characters, whitespace or raw non-ASCII
       (RFC 3986: an IRI is sent percent-encoded);
     * `http`/`https` need an authority whose host is a DNS name, an IPv4 address or
       a bracketed IPv6 literal, an optional port 1-65535, and no user-info;
-    * `obsidian` needs a non-empty destination, and no user-info in an authority.
+    * application schemes need a non-empty destination and no credentials.
 
     The refusal messages only explain which part failed; they never change the
     decision, and they never echo the value.
     """
-    uri = raw.strip()
-    if _LINK_URI.fullmatch(uri):
+    if api_version == "0.6":
+        uri = raw.strip()
+        pattern = _LINK_URI_V06
+        allowed_schemes = API_06_ALLOWED_SCHEMES
+    elif api_version == "0.7":
+        uri = raw
+        pattern = _LINK_URI_V07
+        allowed_schemes = API_07_ALLOWED_SCHEMES
+    else:
+        raise ValueError(f"unsupported Link API version: {api_version}")
+
+    if pattern.fullmatch(uri) and not _ONENOTE_CREDENTIALS.match(uri):
         return uri
     if not uri:
         raise InvalidItem("uri must not be empty")
     scheme = _SCHEME.match(uri)
-    if not scheme or scheme.group(1).lower() not in ALLOWED_SCHEMES:
-        raise InvalidItem("uri scheme must be one of " + ", ".join(ALLOWED_SCHEMES))
+    if not scheme or scheme.group(1).lower() not in allowed_schemes:
+        raise InvalidItem("uri scheme must be one of " + ", ".join(allowed_schemes))
     raise InvalidItem("uri is not well formed: it needs a valid host or destination, "
                       "printable ASCII only, and no user-info")
 
@@ -421,12 +445,21 @@ async def list_items(
     if not await _project_visible(conn, project_id):
         raise NotFound("no such project in this tenant")
     table, columns = _table(kind)
-    order = ("pinned desc, created_at desc, id desc" if kind == "note"
-             else "created_at desc, id desc")
-    cur = await conn.execute(
-        f"select {columns} from {table} where project_id = %s order by {order}",
-        (project_id,),
-    )
+    if kind == "note":
+        cur = await conn.execute(
+            f"select {columns} from {table} where project_id = %s"
+            " order by pinned desc, created_at desc, id desc", (project_id,)
+        )
+    else:
+        cur = await conn.execute(
+            "select l.tenant_id, l.id, l.project_id, l.title, l.uri, l.created_at,"
+            " l.updated_at, l.row_version, l.deleted_at, l.last_operation_id"
+            f" from {table} l"
+            " left join blocks.link_order_positions o"
+            "   on o.tenant_id = l.tenant_id and o.project_id = l.project_id and o.link_id = l.id"
+            " where l.project_id = %s"
+            " order by o.position nulls last, l.created_at, l.id", (project_id,)
+        )
     return list(await cur.fetchall())
 
 

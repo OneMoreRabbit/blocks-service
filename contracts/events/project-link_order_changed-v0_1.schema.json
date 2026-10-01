@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://blocks.onemorerabbit.dev/schemas/project-link_order_changed-v0_1.schema.json",
+  "title": "project.link_order_changed 0.1",
+  "description": "A Project's live-Link order changed. Identifier-only; clients read the aggregate for its sequence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["aggregateId", "projectId", "version", "operationId"],
+  "properties": {
+    "aggregateId": {"type": "string", "format": "uuid"},
+    "projectId": {"type": "string", "format": "uuid"},
+    "version": {"type": "integer", "minimum": 1},
+    "operationId": {"type": "string", "format": "uuid"}
+  }
+}
