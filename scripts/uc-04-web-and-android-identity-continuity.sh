@@ -10,8 +10,88 @@ ATLAS_HEAD=ac387e32ea22ed84079cc45d5c78bfef9dadce37
 build_dir=$(mktemp -d /tmp/blocks-service-uc04-build.XXXXXX)
 old_dir=$(mktemp -d /tmp/blocks-service-uc04-old.XXXXXX)
 reviewed_dir=$(mktemp -d /tmp/blocks-service-uc04-reviewed.XXXXXX)
+floor_dir=$(mktemp -d /tmp/blocks-service-uc04-floor.XXXXXX)
 full_output=$(mktemp /tmp/blocks-service-uc04-full.XXXXXX)
-trap 'rm -rf "$build_dir" "$old_dir" "$reviewed_dir" "$full_output"' EXIT HUP INT TERM
+trap 'rm -rf "$build_dir" "$old_dir" "$reviewed_dir" "$floor_dir" "$full_output"' EXIT HUP INT TERM
+
+echo 'DEPENDENCY FLOOR — clean pydantic-settings 2.7.0 import and settings behavior'
+echo 'COMMAND: create an isolated virtual environment, install exact pydantic-settings==2.7.0, and import current source'
+echo 'EXPECTED: NoDecode imports; legacy omission, padded null, padded valid array, and quoted .env behavior pass.'
+python3 -m venv "$floor_dir/venv"
+"$floor_dir/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+  'pydantic-settings==2.7.0'
+PYTHONPATH=src "$floor_dir/venv/bin/python" - <<'PY'
+import importlib.metadata
+import os
+import tempfile
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from blocks_service.config import Settings
+
+
+base = {
+    "BLOCKS_ENV": "test",
+    "BLOCKS_IDENTITY_MODE": "oidc",
+    "BLOCKS_OIDC_ISSUER": "https://issuer.example.test",
+    "BLOCKS_OIDC_JWKS_URL": "https://issuer.example.test/jwks",
+}
+original = os.environ.copy()
+try:
+    os.environ.clear()
+    os.environ.update(base)
+    os.environ["BLOCKS_OIDC_AUDIENCE"] = "android.example.test"
+    assert Settings(_env_file=None).accepted_oidc_audiences == (
+        "android.example.test",
+    )
+
+    os.environ["BLOCKS_OIDC_AUDIENCES"] = " null "
+    try:
+        Settings(_env_file=None)
+    except ValidationError as exc:
+        assert "BLOCKS_OIDC_AUDIENCES must not be null" in str(exc)
+    else:
+        raise AssertionError("padded process null was accepted")
+
+    os.environ.pop("BLOCKS_OIDC_AUDIENCE")
+    os.environ["BLOCKS_OIDC_AUDIENCES"] = (
+        ' ["android.example.test", "web.example.test"] '
+    )
+    assert Settings(_env_file=None).accepted_oidc_audiences == (
+        "android.example.test",
+        "web.example.test",
+    )
+
+    os.environ.clear()
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / ".env"
+        path.write_text(
+            "\n".join(
+                [
+                    *(f"{key}={value}" for key, value in base.items()),
+                    "BLOCKS_OIDC_AUDIENCE=android.example.test",
+                    "BLOCKS_OIDC_AUDIENCES=' null '",
+                ]
+            )
+            + "\n"
+        )
+        try:
+            Settings(_env_file=path)
+        except ValidationError as exc:
+            assert "BLOCKS_OIDC_AUDIENCES must not be null" in str(exc)
+        else:
+            raise AssertionError("quoted dotenv padded null was accepted")
+finally:
+    os.environ.clear()
+    os.environ.update(original)
+
+assert importlib.metadata.version("pydantic-settings") == "2.7.0"
+print("pydantic-settings 2.7.0")
+print("NoDecode import: pass")
+print("omission/null/padded-array/.env settings: pass")
+PY
+echo 'DEPENDENCY FLOOR VERDICT: pass'
 
 echo 'BUILD — exactly one proposed 0.8.0 package build in this run'
 echo 'COMMAND: archive the exact code head, then run python3 -m pip wheel --no-deps --no-build-isolation once in that clean tree'
