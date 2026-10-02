@@ -7,11 +7,13 @@ mode and the database role -- are validated at construction rather than trusted.
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Environment(str, Enum):
@@ -65,6 +67,10 @@ class Settings(BaseSettings):
     identity_mode: IdentityMode = IdentityMode.dev
     oidc_issuer: str = ""
     oidc_audience: str = ""
+    #: JSON array of exact accepted audiences. Mutually exclusive with the
+    #: legacy singular setting above so a malformed rollout cannot silently
+    #: select a different policy.
+    oidc_audiences: Annotated[list[str] | None, NoDecode] = None
     oidc_jwks_url: str = ""
 
     #: HS256 signing key for the substituted dev verifier. Dev/test only.
@@ -79,6 +85,17 @@ class Settings(BaseSettings):
     #: an offline client may be many releases behind through no fault of its own.
     min_client_version: str = "0.0.0"
 
+    @field_validator("oidc_audiences", mode="before")
+    @classmethod
+    def _decode_audience_list(cls, value):
+        """Decode here so top-level JSON null retains explicit field presence."""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must be a JSON array") from exc
+        return value
+
     @model_validator(mode="after")
     def _refuse_unsafe_combinations(self) -> "Settings":
         if self.env is Environment.production:
@@ -89,14 +106,48 @@ class Settings(BaseSettings):
                 )
             if not self.db_app_password:
                 raise ValueError("BLOCKS_DB_APP_PASSWORD is required when BLOCKS_ENV=production")
+        audiences_supplied = "oidc_audiences" in self.model_fields_set
+        if audiences_supplied:
+            if self.oidc_audiences is None:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must not be null")
+            if self.oidc_audience:
+                raise ValueError(
+                    "set only one of BLOCKS_OIDC_AUDIENCE or BLOCKS_OIDC_AUDIENCES"
+                )
+            if not self.oidc_audiences:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must contain at least one audience")
+            for audience in self.oidc_audiences:
+                self._validate_audience(audience, setting="BLOCKS_OIDC_AUDIENCES")
+            if len(set(self.oidc_audiences)) != len(self.oidc_audiences):
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must not contain duplicate audiences")
+        elif self.oidc_audience:
+            self._validate_audience(self.oidc_audience, setting="BLOCKS_OIDC_AUDIENCE")
+
         if self.identity_mode is IdentityMode.oidc and not (
-            self.oidc_issuer and self.oidc_audience and self.oidc_jwks_url
+            self.oidc_issuer and self.accepted_oidc_audiences and self.oidc_jwks_url
         ):
             raise ValueError(
                 "identity_mode=oidc requires BLOCKS_OIDC_ISSUER, "
-                "BLOCKS_OIDC_AUDIENCE and BLOCKS_OIDC_JWKS_URL"
+                "one of BLOCKS_OIDC_AUDIENCE or BLOCKS_OIDC_AUDIENCES, "
+                "and BLOCKS_OIDC_JWKS_URL"
             )
         return self
+
+    @staticmethod
+    def _validate_audience(audience: str, *, setting: str) -> None:
+        if not audience or audience != audience.strip():
+            raise ValueError(f"{setting} entries must be non-empty and unpadded")
+        if "*" in audience:
+            raise ValueError(f"{setting} entries must not contain wildcard syntax")
+
+    @property
+    def accepted_oidc_audiences(self) -> tuple[str, ...]:
+        """The one explicit audience policy used by the verifier."""
+        if self.oidc_audiences is not None:
+            return tuple(self.oidc_audiences)
+        if self.oidc_audience:
+            return (self.oidc_audience,)
+        return ()
 
     def dsn(self, *, user: str, password: str) -> str:
         parts = [
