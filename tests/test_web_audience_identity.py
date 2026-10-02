@@ -230,18 +230,20 @@ def _set_oidc_environment(monkeypatch, *, audiences=UNSET, legacy=False):
         monkeypatch.setenv("BLOCKS_OIDC_AUDIENCES", audiences)
 
 
+@pytest.mark.parametrize("raw", ["null", " null ", "\tnull\n"])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_process_environment_distinguishes_explicit_null_from_omission(
-    monkeypatch, legacy
+    monkeypatch, legacy, raw
 ):
-    _set_oidc_environment(monkeypatch, audiences="null", legacy=legacy)
+    _set_oidc_environment(monkeypatch, audiences=raw, legacy=legacy)
     with pytest.raises(ValidationError, match="BLOCKS_OIDC_AUDIENCES must not be null"):
         Settings(_env_file=None)
 
 
+@pytest.mark.parametrize("raw", ["null", "' null '"])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_dotenv_distinguishes_explicit_null_from_omission(
-    monkeypatch, tmp_path, legacy
+    monkeypatch, tmp_path, legacy, raw
 ):
     _set_oidc_environment(monkeypatch)
     lines = [
@@ -249,7 +251,7 @@ def test_dotenv_distinguishes_explicit_null_from_omission(
         "BLOCKS_IDENTITY_MODE=oidc",
         f"BLOCKS_OIDC_ISSUER={ISSUER}",
         "BLOCKS_OIDC_JWKS_URL=https://issuer.example.test/jwks",
-        "BLOCKS_OIDC_AUDIENCES=null",
+        f"BLOCKS_OIDC_AUDIENCES={raw}",
     ]
     if legacy:
         lines.append(f"BLOCKS_OIDC_AUDIENCE={ANDROID}")
@@ -257,6 +259,13 @@ def test_dotenv_distinguishes_explicit_null_from_omission(
     path.write_text("\n".join(lines) + "\n")
     with pytest.raises(ValidationError, match="BLOCKS_OIDC_AUDIENCES must not be null"):
         Settings(_env_file=path)
+
+
+def test_regression_padded_null_with_scalar_is_rejected(monkeypatch):
+    """Fails at reviewed head 323bb5b, which treated padded null as omitted."""
+    _set_oidc_environment(monkeypatch, audiences=" null ", legacy=True)
+    with pytest.raises(ValidationError, match="BLOCKS_OIDC_AUDIENCES must not be null"):
+        Settings(_env_file=None)
 
 
 def test_process_environment_omission_preserves_legacy_scalar(monkeypatch):
@@ -280,6 +289,18 @@ def test_dotenv_omission_preserves_legacy_scalar(monkeypatch, tmp_path):
         + "\n"
     )
     assert Settings(_env_file=path).accepted_oidc_audiences == (ANDROID,)
+
+
+def test_json_envelope_whitespace_does_not_rewrite_audience_entries(monkeypatch):
+    _set_oidc_environment(
+        monkeypatch,
+        audiences=f' \t ["{ANDROID}", "{WEB}"] \n',
+    )
+    assert Settings(_env_file=None).accepted_oidc_audiences == (ANDROID, WEB)
+
+    _set_oidc_environment(monkeypatch, audiences=f' [" {ANDROID}"] ')
+    with pytest.raises(ValidationError, match="entries must be non-empty and unpadded"):
+        Settings(_env_file=None)
 
 
 def test_explicit_list_is_json_and_exact(monkeypatch):

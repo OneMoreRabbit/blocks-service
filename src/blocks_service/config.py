@@ -7,11 +7,13 @@ mode and the database role -- are validated at construction rather than trusted.
 
 from __future__ import annotations
 
+import json
 from enum import Enum
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Environment(str, Enum):
@@ -33,10 +35,6 @@ class Settings(BaseSettings):
         env_prefix="BLOCKS_",
         env_file=".env",
         env_file_encoding="utf-8",
-        # Preserve an explicit JSON null as a supplied None. Without this,
-        # pydantic-settings drops it before validation and a legacy scalar can
-        # silently take over.
-        env_parse_none_str="null",
         extra="ignore",
     )
 
@@ -72,7 +70,7 @@ class Settings(BaseSettings):
     #: JSON array of exact accepted audiences. Mutually exclusive with the
     #: legacy singular setting above so a malformed rollout cannot silently
     #: select a different policy.
-    oidc_audiences: list[str] | None = None
+    oidc_audiences: Annotated[list[str] | None, NoDecode] = None
     oidc_jwks_url: str = ""
 
     #: HS256 signing key for the substituted dev verifier. Dev/test only.
@@ -86,6 +84,17 @@ class Settings(BaseSettings):
     #: existing clients predate it. Raising this is a deliberate, announced act --
     #: an offline client may be many releases behind through no fault of its own.
     min_client_version: str = "0.0.0"
+
+    @field_validator("oidc_audiences", mode="before")
+    @classmethod
+    def _decode_audience_list(cls, value):
+        """Decode here so top-level JSON null retains explicit field presence."""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must be a JSON array") from exc
+        return value
 
     @model_validator(mode="after")
     def _refuse_unsafe_combinations(self) -> "Settings":
