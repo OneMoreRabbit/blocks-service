@@ -58,17 +58,28 @@ async def bootstrap_session(db: Database, principal: Principal) -> Session:
             (principal.issuer, principal.subject),
         )
         row = await cur.fetchone()
+        created = False
 
         if row is None:
             cur = await conn.execute(
                 "insert into blocks.users (issuer, subject, email) values (%s, %s, %s)"
-                " returning id, email",
+                " on conflict (issuer, subject) do nothing returning id, email",
                 (principal.issuer, principal.subject, principal.email),
             )
             row = await cur.fetchone()
+            created = row is not None
+            if row is None:
+                # A concurrent first login committed the exact identity while
+                # this transaction was waiting on the unique constraint.
+                cur = await conn.execute(
+                    "select id, email from blocks.users where issuer = %s and subject = %s",
+                    (principal.issuer, principal.subject),
+                )
+                row = await cur.fetchone()
             assert row is not None
-            user_id = row["id"]
 
+        user_id = row["id"]
+        if created:
             cur = await conn.execute(
                 "insert into blocks.tenants (kind, name, personal_for)"
                 " values ('personal', %s, %s) returning id",
@@ -88,9 +99,6 @@ async def bootstrap_session(db: Database, principal: Principal) -> Session:
                 " values (%s, %s, 'owner')",
                 (personal_tenant_id, user_id),
             )
-        else:
-            user_id = row["id"]
-
         cur = await conn.execute(
             "select id, kind::text as kind, name, personal_for"
             " from blocks.tenants where personal_for = %s",

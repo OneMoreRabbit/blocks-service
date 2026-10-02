@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     identity_mode: IdentityMode = IdentityMode.dev
     oidc_issuer: str = ""
     oidc_audience: str = ""
+    #: JSON array of exact accepted audiences. Mutually exclusive with the
+    #: legacy singular setting above so a malformed rollout cannot silently
+    #: select a different policy.
+    oidc_audiences: list[str] | None = None
     oidc_jwks_url: str = ""
 
     #: HS256 signing key for the substituted dev verifier. Dev/test only.
@@ -89,14 +93,45 @@ class Settings(BaseSettings):
                 )
             if not self.db_app_password:
                 raise ValueError("BLOCKS_DB_APP_PASSWORD is required when BLOCKS_ENV=production")
+        if self.oidc_audiences is not None:
+            if self.oidc_audience:
+                raise ValueError(
+                    "set only one of BLOCKS_OIDC_AUDIENCE or BLOCKS_OIDC_AUDIENCES"
+                )
+            if not self.oidc_audiences:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must contain at least one audience")
+            for audience in self.oidc_audiences:
+                self._validate_audience(audience, setting="BLOCKS_OIDC_AUDIENCES")
+            if len(set(self.oidc_audiences)) != len(self.oidc_audiences):
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must not contain duplicate audiences")
+        elif self.oidc_audience:
+            self._validate_audience(self.oidc_audience, setting="BLOCKS_OIDC_AUDIENCE")
+
         if self.identity_mode is IdentityMode.oidc and not (
-            self.oidc_issuer and self.oidc_audience and self.oidc_jwks_url
+            self.oidc_issuer and self.accepted_oidc_audiences and self.oidc_jwks_url
         ):
             raise ValueError(
                 "identity_mode=oidc requires BLOCKS_OIDC_ISSUER, "
-                "BLOCKS_OIDC_AUDIENCE and BLOCKS_OIDC_JWKS_URL"
+                "one of BLOCKS_OIDC_AUDIENCE or BLOCKS_OIDC_AUDIENCES, "
+                "and BLOCKS_OIDC_JWKS_URL"
             )
         return self
+
+    @staticmethod
+    def _validate_audience(audience: str, *, setting: str) -> None:
+        if not audience or audience != audience.strip():
+            raise ValueError(f"{setting} entries must be non-empty and unpadded")
+        if "*" in audience:
+            raise ValueError(f"{setting} entries must not contain wildcard syntax")
+
+    @property
+    def accepted_oidc_audiences(self) -> tuple[str, ...]:
+        """The one explicit audience policy used by the verifier."""
+        if self.oidc_audiences is not None:
+            return tuple(self.oidc_audiences)
+        if self.oidc_audience:
+            return (self.oidc_audience,)
+        return ()
 
     def dsn(self, *, user: str, password: str) -> str:
         parts = [
