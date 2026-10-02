@@ -33,6 +33,7 @@ ANDROID = "blocks-android.example.test"
 WEB = "blocks-web.example.test"
 THIRD = "untrusted-client.example.test"
 KID = "disposable-uc-04-key"
+UNSET = object()
 
 
 @pytest.fixture(scope="module")
@@ -113,16 +114,20 @@ def oidc_token(oidc_keys):
     return mint
 
 
-def _settings(base: Settings, jwks_url: str, *, audience: str = "", audiences=None) -> Settings:
+def _settings(
+    base: Settings, jwks_url: str, *, audience: str = "", audiences=UNSET
+) -> Settings:
     values = base.model_dump()
+    values.pop("oidc_audiences", None)
     values.update(
         env=Environment.test,
         identity_mode=IdentityMode.oidc,
         oidc_issuer=ISSUER,
         oidc_audience=audience,
-        oidc_audiences=audiences,
         oidc_jwks_url=jwks_url,
     )
+    if audiences is not UNSET:
+        values["oidc_audiences"] = audiences
     return Settings(**values)
 
 
@@ -203,6 +208,78 @@ def test_malformed_explicit_list_does_not_fall_back_to_legacy(monkeypatch):
         monkeypatch.setenv(name, value)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def _set_oidc_environment(monkeypatch, *, audiences=UNSET, legacy=False):
+    for name in (
+        "BLOCKS_ENV",
+        "BLOCKS_IDENTITY_MODE",
+        "BLOCKS_OIDC_ISSUER",
+        "BLOCKS_OIDC_AUDIENCE",
+        "BLOCKS_OIDC_AUDIENCES",
+        "BLOCKS_OIDC_JWKS_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BLOCKS_ENV", "test")
+    monkeypatch.setenv("BLOCKS_IDENTITY_MODE", "oidc")
+    monkeypatch.setenv("BLOCKS_OIDC_ISSUER", ISSUER)
+    monkeypatch.setenv("BLOCKS_OIDC_JWKS_URL", "https://issuer.example.test/jwks")
+    if legacy:
+        monkeypatch.setenv("BLOCKS_OIDC_AUDIENCE", ANDROID)
+    if audiences is not UNSET:
+        monkeypatch.setenv("BLOCKS_OIDC_AUDIENCES", audiences)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_process_environment_distinguishes_explicit_null_from_omission(
+    monkeypatch, legacy
+):
+    _set_oidc_environment(monkeypatch, audiences="null", legacy=legacy)
+    with pytest.raises(ValidationError, match="BLOCKS_OIDC_AUDIENCES must not be null"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_dotenv_distinguishes_explicit_null_from_omission(
+    monkeypatch, tmp_path, legacy
+):
+    _set_oidc_environment(monkeypatch)
+    lines = [
+        "BLOCKS_ENV=test",
+        "BLOCKS_IDENTITY_MODE=oidc",
+        f"BLOCKS_OIDC_ISSUER={ISSUER}",
+        "BLOCKS_OIDC_JWKS_URL=https://issuer.example.test/jwks",
+        "BLOCKS_OIDC_AUDIENCES=null",
+    ]
+    if legacy:
+        lines.append(f"BLOCKS_OIDC_AUDIENCE={ANDROID}")
+    path = tmp_path / ".env"
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(ValidationError, match="BLOCKS_OIDC_AUDIENCES must not be null"):
+        Settings(_env_file=path)
+
+
+def test_process_environment_omission_preserves_legacy_scalar(monkeypatch):
+    _set_oidc_environment(monkeypatch, legacy=True)
+    assert Settings(_env_file=None).accepted_oidc_audiences == (ANDROID,)
+
+
+def test_dotenv_omission_preserves_legacy_scalar(monkeypatch, tmp_path):
+    _set_oidc_environment(monkeypatch)
+    path = tmp_path / ".env"
+    path.write_text(
+        "\n".join(
+            [
+                "BLOCKS_ENV=test",
+                "BLOCKS_IDENTITY_MODE=oidc",
+                f"BLOCKS_OIDC_ISSUER={ISSUER}",
+                f"BLOCKS_OIDC_AUDIENCE={ANDROID}",
+                "BLOCKS_OIDC_JWKS_URL=https://issuer.example.test/jwks",
+            ]
+        )
+        + "\n"
+    )
+    assert Settings(_env_file=path).accepted_oidc_audiences == (ANDROID,)
 
 
 def test_explicit_list_is_json_and_exact(monkeypatch):

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
         env_prefix="BLOCKS_",
         env_file=".env",
         env_file_encoding="utf-8",
+        # Preserve an explicit JSON null as a supplied None. Without this,
+        # pydantic-settings drops it before validation and a legacy scalar can
+        # silently take over.
+        env_parse_none_str="null",
         extra="ignore",
     )
 
@@ -93,7 +97,10 @@ class Settings(BaseSettings):
                 )
             if not self.db_app_password:
                 raise ValueError("BLOCKS_DB_APP_PASSWORD is required when BLOCKS_ENV=production")
-        if self.oidc_audiences is not None:
+        audiences_supplied = "oidc_audiences" in self.model_fields_set
+        if audiences_supplied:
+            if self.oidc_audiences is None:
+                raise ValueError("BLOCKS_OIDC_AUDIENCES must not be null")
             if self.oidc_audience:
                 raise ValueError(
                     "set only one of BLOCKS_OIDC_AUDIENCE or BLOCKS_OIDC_AUDIENCES"

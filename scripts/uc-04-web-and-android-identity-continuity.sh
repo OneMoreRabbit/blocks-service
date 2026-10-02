@@ -24,15 +24,17 @@ git archive HEAD | tar -x -C "$build_dir/source"
 test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.8.0-*.whl' | wc -l)" -eq 1
 echo 'BUILD VERDICT: pass'
 
-echo 'REGRESSION — exact old head rejects the second configured audience'
-echo "COMMAND: run test_regression_second_configured_audience_is_accepted with source at $OLD_HEAD"
-echo "EXPECTED: one failure containing 'Audience doesn't match'; a pass would invalidate the regression."
+echo 'REGRESSION — exact old head lacks the second audience and explicit-null repair'
+echo "COMMAND: run second-audience and explicit-null regressions with source at $OLD_HEAD"
+echo "EXPECTED: two failures: 'Audience doesn't match' and explicit null does not raise; a pass would invalidate either regression."
 git archive "$OLD_HEAD" | tar -x -C "$old_dir"
-cp tests/test_web_audience_identity.py "$old_dir/tests/test_web_audience_identity.py"
+mkdir "$old_dir/regression"
+cp tests/test_web_audience_identity.py "$old_dir/regression/test_web_audience_identity.py"
 if (
   cd "$old_dir"
   PYTHONPATH="$old_dir/src" /home/dev/work/blocks-service/.venv/bin/python -m pytest \
-    tests/test_web_audience_identity.py::test_regression_second_configured_audience_is_accepted -q
+    regression/test_web_audience_identity.py::test_regression_second_configured_audience_is_accepted \
+    'regression/test_web_audience_identity.py::test_process_environment_distinguishes_explicit_null_from_omission[True]' -q
 ) >"$old_dir/result.txt" 2>&1; then
   cat "$old_dir/result.txt"
   echo 'REGRESSION VERDICT: fail — old code unexpectedly accepted the Web audience'
@@ -40,6 +42,7 @@ if (
 fi
 cat "$old_dir/result.txt"
 grep -q "Audience doesn't match" "$old_dir/result.txt"
+grep -q "DID NOT RAISE" "$old_dir/result.txt"
 echo 'REGRESSION VERDICT: pass — expected failure observed'
 
 echo 'CASE 1 — legacy Android audience remains exact across restart'
@@ -69,10 +72,14 @@ echo 'CASE 3 VERDICT: pass'
 
 echo 'CASE 4 — fail-closed configuration, aud shapes and retained azp behavior'
 echo 'COMMAND: run invalid config, JSON list, aud string/array, and azp tests'
-echo 'EXPECTED: all selected checks pass; malformed/empty/wildcard/duplicate/both forms fail before serving.'
+echo 'EXPECTED: all selected checks pass; explicit null, malformed/empty/wildcard/duplicate/both forms fail before serving, while omission retains the scalar.'
 .venv/bin/python -m pytest \
   tests/test_web_audience_identity.py::test_invalid_or_ambiguous_audience_configuration_fails_before_serving \
   tests/test_web_audience_identity.py::test_malformed_explicit_list_does_not_fall_back_to_legacy \
+  tests/test_web_audience_identity.py::test_process_environment_distinguishes_explicit_null_from_omission \
+  tests/test_web_audience_identity.py::test_dotenv_distinguishes_explicit_null_from_omission \
+  tests/test_web_audience_identity.py::test_process_environment_omission_preserves_legacy_scalar \
+  tests/test_web_audience_identity.py::test_dotenv_omission_preserves_legacy_scalar \
   tests/test_web_audience_identity.py::test_explicit_list_is_json_and_exact \
   tests/test_web_audience_identity.py::test_audience_string_array_and_existing_azp_behavior -q
 echo 'CASE 4 VERDICT: pass'
@@ -84,9 +91,9 @@ echo 'CASE 5 VERDICT: pass'
 
 echo 'FULL GATE — complete real-PostgreSQL repository suite, zero skips'
 echo 'COMMAND: .venv/bin/python -m pytest -q'
-echo 'EXPECTED: 512 passed, with no skipped/xfailed/xpassed tests.'
+echo 'EXPECTED: 518 passed, with no skipped/xfailed/xpassed tests.'
 .venv/bin/python -m pytest -q | tee "$full_output"
-grep -Eq '^512 passed in ' "$full_output"
+grep -Eq '^518 passed in ' "$full_output"
 if grep -Eq 'skipped|xfailed|xpassed' "$full_output"; then
   echo 'FULL GATE VERDICT: fail — non-passing outcome present'
   exit 1
