@@ -1368,18 +1368,26 @@ def test_0015_backfills_the_exact_visible_note_order_without_rewriting_notes(leg
         ).fetchone()
 
     import uuid as _uuid
+    # Deliberately make creation and edit times disagree in both pin groups.
+    # Released Android 0.9.6 displayed updatedAt-descending within each group,
+    # so each older-created but later-edited Note must precede the newer one.
     notes = [
-        (_uuid.uuid4(), "unpinned older", False, "2026-01-01T00:00:00Z"),
-        (_uuid.uuid4(), "pinned older", True, "2026-01-02T00:00:00Z"),
-        (_uuid.uuid4(), "unpinned newer", False, "2026-01-03T00:00:00Z"),
-        (_uuid.uuid4(), "pinned newer", True, "2026-01-04T00:00:00Z"),
-        (_uuid.uuid4(), "deleted pinned", True, "2026-01-05T00:00:00Z"),
+        (_uuid.uuid4(), "unpinned older edited", False,
+         "2026-01-01T00:00:00Z", "2026-01-08T00:00:00Z"),
+        (_uuid.uuid4(), "pinned older edited", True,
+         "2026-01-02T00:00:00Z", "2026-01-10T00:00:00Z"),
+        (_uuid.uuid4(), "unpinned newer", False,
+         "2026-01-03T00:00:00Z", "2026-01-07T00:00:00Z"),
+        (_uuid.uuid4(), "pinned newer", True,
+         "2026-01-04T00:00:00Z", "2026-01-09T00:00:00Z"),
+        (_uuid.uuid4(), "deleted pinned", True,
+         "2026-01-05T00:00:00Z", "2026-01-11T00:00:00Z"),
     ]
     with psycopg.connect(_dsn(legacy_db), autocommit=True) as conn:
         conn.execute("set role blocks_owner")
         conn.execute("select set_config('blocks.tenant_id', %s, false)",
                      (str(parent["tenant_id"]),))
-        for index, (note_id, body, pinned, created_at) in enumerate(notes):
+        for index, (note_id, body, pinned, created_at, updated_at) in enumerate(notes):
             conn.execute(
                 "insert into blocks.project_note_items"
                 " (tenant_id, id, project_id, body, pinned, authored_by_user_id,"
@@ -1388,7 +1396,7 @@ def test_0015_backfills_the_exact_visible_note_order_without_rewriting_notes(leg
                 "         case when %s = 4 then %s::timestamptz else null end,"
                 "         decode('00', 'hex'), gen_random_uuid())",
                 (parent["tenant_id"], note_id, parent["project_id"], body, pinned,
-                 parent["user_id"], created_at, created_at, index, created_at),
+                 parent["user_id"], created_at, updated_at, index, updated_at),
             )
 
     with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
@@ -1410,7 +1418,7 @@ def test_0015_backfills_the_exact_visible_note_order_without_rewriting_notes(leg
         ).fetchall()
     assert after == before
     assert [row["note_id"] for row in ordered] == [
-        notes[3][0], notes[1][0], notes[2][0], notes[0][0],
+        notes[1][0], notes[3][0], notes[0][0], notes[2][0],
     ]
 
 

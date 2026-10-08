@@ -69,7 +69,7 @@ echo 'CASE 1 VERDICT: pass'
 
 echo 'CASE 2 — exact pre-upgrade Note sequence and immutable legacy fields'
 echo "COMMAND: .venv/bin/python -m pytest tests/test_migration_project_model.py -q -k '0015'"
-echo 'EXPECTED: 4 passed; deterministic backfill, rollback/retry, RLS/grants and composite membership pass.'
+echo 'EXPECTED: 4 passed; pinned/updated_at/ID backfill with disagreeing create/edit times, rollback/retry, RLS/grants and composite membership pass.'
 .venv/bin/python -m pytest tests/test_migration_project_model.py -q -k '0015'
 echo 'CASE 2 VERDICT: pass'
 

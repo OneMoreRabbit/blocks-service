@@ -45,8 +45,8 @@ alter table blocks.interaction_operations
   );
 
 -- The prior visible sequence is pinned Notes first, then unpinned Notes, with
--- each group in its existing stable newest-first order. Only live membership is
--- copied into the new aggregate.
+-- each group in its released Android 0.9.6 visible order: most recently updated
+-- first, then ID descending. Only live membership is copied into the new aggregate.
 alter table blocks.projects no force row level security;
 alter table blocks.project_note_items no force row level security;
 
@@ -57,7 +57,7 @@ insert into blocks.note_order_positions (tenant_id, project_id, note_id, positio
 select tenant_id, project_id, id,
        row_number() over (
          partition by tenant_id, project_id
-         order by pinned desc, created_at desc, id desc
+         order by pinned desc, updated_at desc, id desc
        )
   from blocks.project_note_items
  where deleted_at is null;
