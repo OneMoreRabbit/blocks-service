@@ -33,6 +33,7 @@ from .operating_loop import ConcurrencyConflict, DomainError, NotFound
 
 API_06_ALLOWED_SCHEMES = ("http", "https", "obsidian")
 API_07_ALLOWED_SCHEMES = (*API_06_ALLOWED_SCHEMES, "onenote")
+API_08_ALLOWED_SCHEMES = API_07_ALLOWED_SCHEMES
 NOTE_BODY_MAX = 100_000
 LINK_TITLE_MAX = 200
 
@@ -129,6 +130,7 @@ _LINK_URI_V06 = re.compile(LINK_URI_V06_PATTERN)
 #: Migration 0014 combines the installed 0013 rule with the OneNote branch.
 LINK_URI_PATTERN = f"^({_HTTP}|{_OBSIDIAN}|{_ONENOTE})$"
 _LINK_URI_V07 = re.compile(LINK_URI_PATTERN)
+_LINK_URI_V08 = _LINK_URI_V07
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 
 
@@ -158,10 +160,12 @@ def validate_uri(raw: str, *, api_version: str) -> str:
         uri = raw.strip()
         pattern = _LINK_URI_V06
         allowed_schemes = API_06_ALLOWED_SCHEMES
-    elif api_version == "0.7":
+    elif api_version in {"0.7", "0.8"}:
         uri = raw
-        pattern = _LINK_URI_V07
-        allowed_schemes = API_07_ALLOWED_SCHEMES
+        pattern = _LINK_URI_V08 if api_version == "0.8" else _LINK_URI_V07
+        allowed_schemes = (
+            API_08_ALLOWED_SCHEMES if api_version == "0.8" else API_07_ALLOWED_SCHEMES
+        )
     else:
         raise ValueError(f"unsupported Link API version: {api_version}")
 
@@ -447,8 +451,16 @@ async def list_items(
     table, columns = _table(kind)
     if kind == "note":
         cur = await conn.execute(
-            f"select {columns} from {table} where project_id = %s"
-            " order by pinned desc, created_at desc, id desc", (project_id,)
+            "select n.tenant_id, n.id, n.project_id, n.body, n.pinned,"
+            " n.authored_by_user_id, n.created_at, n.updated_at, n.row_version,"
+            " n.deleted_at, n.last_operation_id"
+            f" from {table} n"
+            " left join blocks.note_order_positions o"
+            "   on o.tenant_id = n.tenant_id and o.project_id = n.project_id"
+            "  and o.note_id = n.id"
+            " where n.project_id = %s"
+            " order by (n.deleted_at is not null), o.position nulls last,"
+            " n.created_at desc, n.id desc", (project_id,)
         )
     else:
         cur = await conn.execute(

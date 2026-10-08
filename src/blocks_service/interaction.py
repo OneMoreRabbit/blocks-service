@@ -1,4 +1,4 @@
-"""API 0.7 ordered aggregates and Park tombstones (ADR-0024)."""
+"""Ordered aggregates and Park tombstones (ADR-0024 and ADR-0028)."""
 
 from __future__ import annotations
 
@@ -123,6 +123,31 @@ async def link_order(
         "aggregate_id": aggregate["aggregate_id"],
         "project_id": project_id,
         "ordered_client_ids": [str(row["link_id"]) for row in await cur.fetchall()],
+        "version": aggregate["version"],
+    }
+
+
+async def note_order(
+    conn: psycopg.AsyncConnection, tenant_id: UUID, project_id: UUID
+) -> dict:
+    cur = await conn.execute(
+        "select aggregate_id, version, last_operation_id"
+        " from blocks.note_order_aggregates where project_id = %s",
+        (project_id,),
+    )
+    aggregate = await cur.fetchone()
+    if aggregate is None:
+        raise NotFound("no such project in this tenant")
+    cur = await conn.execute(
+        "select note_id from blocks.note_order_positions"
+        " where project_id = %s order by position",
+        (project_id,),
+    )
+    return {
+        "operation_id": aggregate["last_operation_id"],
+        "aggregate_id": aggregate["aggregate_id"],
+        "project_id": project_id,
+        "ordered_client_ids": [str(row["note_id"]) for row in await cur.fetchall()],
         "version": aggregate["version"],
     }
 
@@ -275,6 +300,85 @@ async def reorder_links(
     )
     await events.emit(
         conn, tenant_id=tenant_id, event_type="project.link_order_changed",
+        payload={"aggregateId": str(aggregate_id), "projectId": str(project_id),
+                 "version": version, "operationId": str(operation_id)},
+    )
+    return result, False
+
+
+async def reorder_notes(
+    conn: psycopg.AsyncConnection,
+    tenant_id: UUID,
+    project_id: UUID,
+    *,
+    operation_id: UUID,
+    aggregate_id: UUID,
+    base_version: int,
+    ordered_client_ids: list[UUID],
+) -> tuple[dict, bool]:
+    envelope = {
+        "operation_id": str(operation_id), "type": "REORDER_NOTES",
+        "aggregate_id": str(aggregate_id), "project_id": str(project_id),
+        "base_version": base_version,
+        "ordered_client_ids": [str(value) for value in ordered_client_ids],
+    }
+    fingerprint = _fingerprint(envelope)
+    if receipt := await _receipt(conn, operation_id):
+        return _replay(receipt, fingerprint), True
+    cur = await conn.execute(
+        "select version from blocks.note_order_aggregates"
+        " where project_id = %s and aggregate_id = %s for update",
+        (project_id, aggregate_id),
+    )
+    aggregate = await cur.fetchone()
+    if aggregate is None:
+        raise NotFound("no such Note order aggregate in this project")
+    if receipt := await _receipt(conn, operation_id):
+        return _replay(receipt, fingerprint), True
+    if aggregate["version"] != base_version:
+        raise InteractionConflict("Note order version is stale; read and reconcile")
+    if len(set(ordered_client_ids)) != len(ordered_client_ids):
+        raise InvalidInteraction("ordered_client_ids must contain every live member exactly once")
+    cur = await conn.execute(
+        "select id from blocks.project_note_items"
+        " where project_id = %s and deleted_at is null",
+        (project_id,),
+    )
+    members = {row["id"] for row in await cur.fetchall()}
+    if members != set(ordered_client_ids):
+        raise InvalidInteraction("ordered_client_ids must contain every live member exactly once")
+
+    await conn.execute(
+        "delete from blocks.note_order_positions where project_id = %s", (project_id,)
+    )
+    if ordered_client_ids:
+        await conn.execute(
+            "insert into blocks.note_order_positions (tenant_id, project_id, note_id, position)"
+            " select %s, %s, u.note_id, u.position"
+            " from unnest(%s::uuid[]) with ordinality u(note_id, position)",
+            (tenant_id, project_id, ordered_client_ids),
+        )
+    version = base_version + 1
+    await conn.execute(
+        "update blocks.note_order_aggregates"
+        " set version = %s, last_operation_id = %s, updated_at = now()"
+        " where project_id = %s",
+        (version, operation_id, project_id),
+    )
+    result = {
+        "operation_id": str(operation_id), "aggregate_id": str(aggregate_id),
+        "project_id": str(project_id),
+        "ordered_client_ids": [str(value) for value in ordered_client_ids],
+        "version": version,
+    }
+    await _record(
+        conn, tenant_id=tenant_id, operation_id=operation_id,
+        operation_type="REORDER_NOTES", aggregate_id=aggregate_id,
+        project_id=project_id, target_id=None, base_version=base_version,
+        fingerprint=fingerprint, result=result,
+    )
+    await events.emit(
+        conn, tenant_id=tenant_id, event_type="project.note_order_changed",
         payload={"aggregateId": str(aggregate_id), "projectId": str(project_id),
                  "version": version, "operationId": str(operation_id)},
     )

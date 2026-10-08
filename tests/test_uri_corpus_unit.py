@@ -11,6 +11,9 @@ from blocks_service.project_items import InvalidItem, validate_uri
 CORPUS = json.loads(
     (pathlib.Path(__file__).parent / "project-resource-uri-validation-v0_3.json").read_text()
 )
+CORPUS_V04 = json.loads(
+    (pathlib.Path(__file__).parent / "project-resource-uri-validation-v0_4.json").read_text()
+)
 
 
 @pytest.mark.parametrize("uri", CORPUS["accepted"])
@@ -22,3 +25,14 @@ def test_shared_v03_accepted_uri(uri):
 def test_shared_v03_refused_uri(uri):
     with pytest.raises(InvalidItem):
         validate_uri(uri, api_version="0.7")
+
+
+@pytest.mark.parametrize("uri", CORPUS_V04["accepted"])
+def test_shared_v04_accepted_uri(uri):
+    assert validate_uri(uri, api_version="0.8") == uri
+
+
+@pytest.mark.parametrize("uri", CORPUS_V04["refused"])
+def test_shared_v04_refused_uri(uri):
+    with pytest.raises(InvalidItem):
+        validate_uri(uri, api_version="0.8")

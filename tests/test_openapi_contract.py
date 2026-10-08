@@ -96,7 +96,16 @@ def test_contract_headers_are_declared_where_they_apply(spec):
     for op in versioned_links:
         header = by_op[op]["X-Blocks-API-Version"]
         assert header["required"] is False, op
-        assert set(header["schema"]["anyOf"][0]["enum"]) == {"0.6", "0.7"}, op
+        assert set(header["schema"]["anyOf"][0]["enum"]) == {"0.6", "0.7", "0.8"}, op
+
+    versioned_note_order = [
+        "GET /v1/tenants/{tenant_id}/projects/{project_id}/interaction/note-order",
+        "PUT /v1/tenants/{tenant_id}/projects/{project_id}/interaction/note-order",
+    ]
+    for op in versioned_note_order:
+        header = by_op[op]["X-Blocks-API-Version"]
+        assert header["required"] is True, op
+        assert header["schema"]["const"] == "0.8", op
 
 
 def test_idempotent_replay_is_declared_as_a_response_header(spec):
@@ -136,7 +145,7 @@ def test_no_success_response_is_untyped_and_no_422_is_advertised(spec):
 
 
 def test_the_document_version_matches_the_contract(spec):
-    assert spec["info"]["version"] == "0.7.0"
+    assert spec["info"]["version"] == "0.8.0"
 
 
 # --------------------------------------------------------------------------
