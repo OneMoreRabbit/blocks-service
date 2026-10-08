@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from blocks_service.app import create_app  # noqa: E402
 from blocks_service.config import Settings  # noqa: E402
 
-API_VERSION = "0.7"
+API_VERSION = "0.8"
 
 
 def main() -> int:

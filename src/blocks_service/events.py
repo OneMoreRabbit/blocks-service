@@ -42,6 +42,7 @@ EVENT_VERSIONS: Final[dict[str, str]] = {
     "project.link_deleted": "0.1",
     "project.order_changed": "0.1",
     "project.link_order_changed": "0.1",
+    "project.note_order_changed": "0.1",
     "project.parking_deleted": "0.1",
     # Discrete project items (ADR-0021). Identifier-only, like every event
     # above: the body a note now carries is exactly what must not travel here.

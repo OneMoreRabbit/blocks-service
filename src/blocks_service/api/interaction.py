@@ -1,11 +1,12 @@
-"""API 0.7 convergence surface for ordered work and Park tombstones."""
+"""Versioned convergence surfaces for ordered work and Park tombstones."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,6 +60,18 @@ class ParkingTombstoneOut(BaseModel):
 
 MUTATION_ERRORS = errors.error_responses(400, 401, 403, 404, 409, 426)
 READ_ERRORS = errors.error_responses(401, 403, 404, 426)
+
+NoteOrderApiVersion = Literal["0.8"]
+
+
+def note_order_api_version(
+    x_blocks_api_version: NoteOrderApiVersion = Header(
+        ...,
+        alias="X-Blocks-API-Version",
+        description="Required explicit negotiation of the API 0.8 Note-order boundary.",
+    ),
+) -> NoteOrderApiVersion:
+    return x_blocks_api_version
 
 
 def _response(result: dict, replayed: bool) -> JSONResponse:
@@ -121,6 +134,41 @@ async def reorder_links(
 ) -> JSONResponse:
     try:
         result, replayed = await interaction.reorder_links(
+            ctx.conn, ctx.tenant_id, project_id,
+            operation_id=body.operation_id, aggregate_id=body.aggregate_id,
+            base_version=body.base_version, ordered_client_ids=body.ordered_client_ids,
+        )
+    except interaction.DomainError as exc:
+        raise as_http(exc) from exc
+    return _response(result, replayed)
+
+
+@router.get(
+    "/projects/{project_id}/interaction/note-order",
+    response_model=OrderOut, responses=READ_ERRORS,
+)
+async def read_note_order(
+    project_id: UUID, ctx: TenantContext = Depends(tenant_context),
+    api_version: NoteOrderApiVersion = Depends(note_order_api_version),
+) -> dict:
+    try:
+        return await interaction.note_order(ctx.conn, ctx.tenant_id, project_id)
+    except interaction.DomainError as exc:
+        raise as_http(exc) from exc
+
+
+@router.put(
+    "/projects/{project_id}/interaction/note-order",
+    response_model=OrderOut, responses=MUTATION_ERRORS,
+    summary="Replace the complete live-Note order for one Project",
+)
+async def reorder_notes(
+    project_id: UUID, body: ReorderIn,
+    ctx: TenantContext = Depends(tenant_context),
+    api_version: NoteOrderApiVersion = Depends(note_order_api_version),
+) -> JSONResponse:
+    try:
+        result, replayed = await interaction.reorder_notes(
             ctx.conn, ctx.tenant_id, project_id,
             operation_id=body.operation_id, aggregate_id=body.aggregate_id,
             base_version=body.base_version, ordered_client_ids=body.ordered_client_ids,

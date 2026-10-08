@@ -21,7 +21,9 @@ from psycopg.rows import dict_row
 MIGRATIONS = sorted(pathlib.Path("migrations").glob("*.sql"))
 PRE = [m for m in MIGRATIONS if m.stem < "0007"]
 EXPAND = [m for m in MIGRATIONS
-          if m.stem.startswith(("0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"))]
+          if m.stem.startswith((
+              "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015",
+          ))]
 TARGET = EXPAND[0]        # 0007 — the relation
 INVARIANT = EXPAND[1]     # 0008 — the trigger and the catch-up
 IDENTITY = EXPAND[2]      # 0009 — creation identity and authored parking time
@@ -30,6 +32,7 @@ RESERVE = EXPAND[4]       # 0011 — idempotency reservation
 BLOCKID = EXPAND[5]       # 0012 — client-generated block identity
 ITEMS = EXPAND[6]         # 0013 — discrete project items
 INTERACTION = EXPAND[7]   # 0014 — ordered aggregates and Park tombstones
+NOTE_ORDER = EXPAND[8]    # 0015 — ordered Notes
 SCRATCH = "blocks_migration_drill"
 
 
@@ -512,10 +515,11 @@ async def test_a_project_created_between_0007_and_0008_is_healed_by_0008(legacy_
     _apply(legacy_db, RESERVE)                      # 0011
     _apply(legacy_db, BLOCKID)                      # 0012
     # 0013 as well: this test then runs the CURRENT application against the
-    # schema, and the current image requires 0013 and 0014.
+    # schema, and the current image requires 0013 through 0015.
     # Project reads carry the navigation key, which lives in a 0013 table.
     _apply(legacy_db, ITEMS)                        # 0013
-    _apply(legacy_db, INTERACTION)                  # 0014 completes the expand step
+    _apply(legacy_db, INTERACTION)                  # 0014
+    _apply(legacy_db, NOTE_ORDER)                   # 0015 completes the expand step
 
     settings = Settings(
         env=Environment.test, db_name=legacy_db, db_app_password=APP_PASSWORD,
@@ -1340,3 +1344,161 @@ def test_0014_structurally_rejects_a_same_tenant_wrong_project_link(legacy_db):
             )
     assert refused.value.diag.constraint_name == "link_order_positions_tenant_id_project_id_link_id_fkey"
     assert positions() == before, "either Project order changed after the refused direct insert"
+
+
+# --------------------------------------------------------------------------
+# 0015 — Note ordering (API 0.8)
+# --------------------------------------------------------------------------
+
+NOTE_ORDER_TABLES = ("note_order_aggregates", "note_order_positions")
+
+
+def _through_0014(dbname: str) -> None:
+    for migration in EXPAND[:8]:
+        _apply(dbname, migration)
+
+
+def test_0015_backfills_the_exact_visible_note_order_without_rewriting_notes(legacy_db):
+    _through_0014(legacy_db)
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        parent = conn.execute(
+            "select p.tenant_id, p.id as project_id, m.user_id"
+            " from blocks.projects p join blocks.memberships m using (tenant_id)"
+            " order by p.id limit 1"
+        ).fetchone()
+
+    import uuid as _uuid
+    notes = [
+        (_uuid.uuid4(), "unpinned older", False, "2026-01-01T00:00:00Z"),
+        (_uuid.uuid4(), "pinned older", True, "2026-01-02T00:00:00Z"),
+        (_uuid.uuid4(), "unpinned newer", False, "2026-01-03T00:00:00Z"),
+        (_uuid.uuid4(), "pinned newer", True, "2026-01-04T00:00:00Z"),
+        (_uuid.uuid4(), "deleted pinned", True, "2026-01-05T00:00:00Z"),
+    ]
+    with psycopg.connect(_dsn(legacy_db), autocommit=True) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, false)",
+                     (str(parent["tenant_id"]),))
+        for index, (note_id, body, pinned, created_at) in enumerate(notes):
+            conn.execute(
+                "insert into blocks.project_note_items"
+                " (tenant_id, id, project_id, body, pinned, authored_by_user_id,"
+                "  created_at, updated_at, deleted_at, creation_fingerprint, last_operation_id)"
+                " values (%s, %s, %s, %s, %s, %s, %s, %s,"
+                "         case when %s = 4 then %s::timestamptz else null end,"
+                "         decode('00', 'hex'), gen_random_uuid())",
+                (parent["tenant_id"], note_id, parent["project_id"], body, pinned,
+                 parent["user_id"], created_at, created_at, index, created_at),
+            )
+
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        before = conn.execute(
+            "select * from blocks.project_note_items where project_id = %s order by id",
+            (parent["project_id"],),
+        ).fetchall()
+
+    _apply(legacy_db, NOTE_ORDER)
+
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        after = conn.execute(
+            "select * from blocks.project_note_items where project_id = %s order by id",
+            (parent["project_id"],),
+        ).fetchall()
+        ordered = conn.execute(
+            "select note_id from blocks.note_order_positions"
+            " where project_id = %s order by position", (parent["project_id"],)
+        ).fetchall()
+    assert after == before
+    assert [row["note_id"] for row in ordered] == [
+        notes[3][0], notes[1][0], notes[2][0], notes[0][0],
+    ]
+
+
+def test_an_interrupted_0015_rolls_back_and_restarts_cleanly(legacy_db):
+    _through_0014(legacy_db)
+    broken = NOTE_ORDER.read_text() + "\nselect 1/0;\n"
+    with psycopg.connect(_dsn(legacy_db), autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            conn.execute(broken)
+        conn.rollback()
+
+    for table in NOTE_ORDER_TABLES:
+        assert not _table_exists(legacy_db, table), f"{table} survived an interrupted apply"
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        operation_rule = conn.execute(
+            "select pg_get_constraintdef(oid) as rule from pg_constraint"
+            " where conrelid = 'blocks.interaction_operations'::regclass"
+            " and conname = 'interaction_operation_type'"
+        ).fetchone()["rule"]
+        note_key = conn.execute(
+            "select 1 from pg_constraint"
+            " where conrelid = 'blocks.project_note_items'::regclass"
+            " and conname = 'project_note_items_tenant_project_id_key'"
+        ).fetchone()
+    assert "REORDER_NOTES" not in operation_rule
+    assert note_key is None
+
+    _apply(legacy_db, NOTE_ORDER)
+    for table in NOTE_ORDER_TABLES:
+        assert _table_exists(legacy_db, table), f"{table} missing after clean re-apply"
+
+
+def test_0015_forces_rls_preserves_read_only_backup_and_grants_no_note_hard_delete(
+    legacy_db,
+):
+    _migrate(legacy_db)
+    with psycopg.connect(_backup_dsn(legacy_db), row_factory=dict_row, autocommit=True) as conn:
+        for table in NOTE_ORDER_TABLES:
+            state = conn.execute(
+                "select relrowsecurity, relforcerowsecurity from pg_class c"
+                " join pg_namespace n on n.oid = c.relnamespace"
+                " where n.nspname = 'blocks' and c.relname = %s", (table,)
+            ).fetchone()
+            assert state["relrowsecurity"] and state["relforcerowsecurity"]
+            conn.execute(f"select count(*) from blocks.{table}").fetchone()
+        assert not conn.execute(
+            "select has_table_privilege('blocks_app',"
+            " 'blocks.project_note_items', 'DELETE') as ok"
+        ).fetchone()["ok"]
+        assert not conn.execute(
+            "select has_table_privilege('blocks_app',"
+            " 'blocks.interaction_operations', 'UPDATE') as ok"
+        ).fetchone()["ok"]
+
+
+def test_0015_structurally_rejects_a_same_tenant_wrong_project_note(legacy_db):
+    _migrate(legacy_db)
+    tenant = _new_tenant(legacy_db, "project-scoped-note-order")
+    project_a = _project_with_singleton(legacy_db, tenant, "A", "")
+    project_b = _project_with_singleton(legacy_db, tenant, "B", "")
+
+    with psycopg.connect(_dsn(legacy_db), row_factory=dict_row, autocommit=False) as conn:
+        conn.execute("set role blocks_owner")
+        conn.execute("select set_config('blocks.tenant_id', %s, true)", (tenant,))
+        note_ids = []
+        for project, body in ((project_a, "A note"), (project_b, "B note")):
+            note_ids.append(conn.execute(
+                "insert into blocks.project_note_items"
+                " (tenant_id, id, project_id, body, creation_fingerprint, last_operation_id)"
+                " values (%s, gen_random_uuid(), %s, %s, decode('00', 'hex'), gen_random_uuid())"
+                " returning id::text as id", (tenant, project, body),
+            ).fetchone()["id"])
+        conn.commit()
+
+    from tests.conftest import APP_PASSWORD
+    host = os.environ.get("BLOCKS_DB_HOST", "postgres")
+    port = os.environ.get("BLOCKS_DB_PORT", "5432")
+    app_dsn = (
+        f"host={host} port={port} user=blocks_app password={APP_PASSWORD} dbname={legacy_db}"
+    )
+    with psycopg.connect(app_dsn, autocommit=True) as conn:
+        conn.execute("select set_config('blocks.tenant_id', %s, false)", (tenant,))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as refused:
+            conn.execute(
+                "insert into blocks.note_order_positions"
+                " (tenant_id, project_id, note_id, position) values (%s, %s, %s, 2)",
+                (tenant, project_b, note_ids[0]),
+            )
+    assert refused.value.diag.constraint_name == \
+        "note_order_positions_tenant_id_project_id_note_id_fkey"

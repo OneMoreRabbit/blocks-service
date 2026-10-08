@@ -84,7 +84,7 @@ class LinkAck(LinkOut):
 
 NON_BLANK = r"\S"
 
-LinkApiVersion = Literal["0.6", "0.7"]
+LinkApiVersion = Literal["0.6", "0.7", "0.8"]
 
 
 def link_api_version(
@@ -94,7 +94,8 @@ def link_api_version(
         description=(
             "Link create/edit contract. Absent or `0.6` preserves API 0.6 surrounding-"
             "whitespace normalization and its HTTP/HTTPS/Obsidian schemes. Explicit `0.7` "
-            "uses the strict no-whitespace v0.3 URI corpus and permits ordinary OneNote URIs."
+            "uses the strict no-whitespace v0.3 URI corpus and permits ordinary OneNote URIs. "
+            "Explicit `0.8` selects the byte-published v0.4 browser-link corpus."
         ),
     ),
 ) -> LinkApiVersion:
@@ -134,6 +135,7 @@ class LinkCreateIn(BaseModel):
         description=(
             "A versioned absolute Link URI. With `X-Blocks-API-Version: 0.7`, the scheme may "
             "be `http`, `https`, `obsidian` or `onenote` and raw whitespace is refused. "
+            "Version `0.8` retains that safe rule and publishes browser-link corpus v0.4. "
             "Absent or `0.6` preserves API 0.6 normalization and its original three schemes. "
             "Service never resolves, fetches or launches the value."
         )
