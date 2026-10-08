@@ -74,7 +74,9 @@ ${_d%/}"
     [ -f "${_d}.atlas.conf" ] || continue
     _sv=$(sed -n 's/^ATLAS_VAULT_REMOTE="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "${_d}.atlas.conf" | tr -d '
 ' | head -1)
-    [ "$_sv" = "$ATLAS_VAULT_REMOTE" ] || continue
+    _svn=$(printf '%s' "$_sv" | sed 's/\.git$//' | tr 'A-Z' 'a-z')
+    _ovn=$(printf '%s' "$ATLAS_VAULT_REMOTE" | sed 's/\.git$//' | tr 'A-Z' 'a-z')
+    [ "$_svn" = "$_ovn" ] || continue
     _ss=$(sed -n 's/^\(COMPONENT\|SLUG\)="\{0,1\}\([^"]*\)"\{0,1\}$/\2/p' "${_d}.atlas.conf" | tr -d '
 ' | head -1)
     [ -n "$_ss" ] && SLUGS="$SLUGS
@@ -119,13 +121,34 @@ try:
     g = open(vault + "/registry/io-graph.yml", encoding="utf-8").read()
 except OSError:
     sys.exit(0)                                # no graph readable: allow, CI decides
-pn = (re.search(r"^project:\s*([\w.-]+)", g, re.M) or [None, ""])[1].lower()
-comps, roles = [], []
-for m in re.finditer(r"^\s*-\s+(?:component|slug):\s*([\w.-]+)(.*?)(?=^\s*-\s|\Z)", g, re.M | re.S):
-    name = m.group(1).lower()
-    r = re.search(r"^\s*role:\s*([\w-]+)", m.group(2), re.M)
-    (roles if (r and r.group(1).lower() != "component") else comps).append(
-        (name, r.group(1).lower() if r else "component"))
+comps, roles, pn = [], [], ""
+_vocab = ("component", "architect", "product", "review", "arch", "test")
+try:
+    # a real YAML parse (1.33.17): the regex below only knows block style, and a
+    # flow-style entry ({component: app, ...}) parsed to nothing - which switched the
+    # address check OFF for that vault. PyYAML ships with every seat (the validator
+    # needs it); the regex stays as the fallback.
+    import yaml
+    _g = yaml.safe_load(g) or {}
+    pn = str(_g.get("project") or "").strip().lower()
+    for _c in _g.get("components") or []:
+        if not isinstance(_c, dict):
+            continue
+        _n = str(_c.get("component") or _c.get("slug") or "").strip().lower()
+        _r = str(_c.get("role") or "component").strip().lower()
+        if _r not in _vocab:
+            _r = "component"
+        if _n:
+            (roles if _r != "component" else comps).append((_n, _r))
+except Exception:
+    comps, roles = [], []
+if not comps and not roles:
+    pn = (re.search(r"^project:\s*([\w.-]+)", g, re.M) or [None, ""])[1].lower()
+    for m in re.finditer(r"^\s*-\s+(?:component|slug):\s*([\w.-]+)(.*?)(?=^\s*-\s|\Z)", g, re.M | re.S):
+        name = m.group(1).lower()
+        r = re.search(r"^\s*role:\s*([\w-]+)", m.group(2), re.M)
+        (roles if (r and r.group(1).lower() != "component") else comps).append(
+            (name, r.group(1).lower() if r else "component"))
 if not comps and not roles:
     sys.exit(0)      # graph parsed to nothing: OUR limitation (flow-style yaml?),
                      # never a confident no-match - allow, CI refusal backstops
@@ -193,8 +216,12 @@ case "$REL" in
   registry/io-graph.yml)    exit 0 ;;
 esac
 if [ "${ATLAS_ROLE:-component}" = "both" ]; then
+  # the union is AS ARCH (1.33.12, maths-practise: architecture/* alone blocked
+  # next-steps.md, roadmap.md and meta/ — required every arch session): everything in
+  # the vault except product/**, which belongs to the product seat in every mode.
   case "$REL" in
-    architecture/*) exit 0 ;;
+    product/*) ;;
+    *) exit 0 ;;
   esac
 fi
 

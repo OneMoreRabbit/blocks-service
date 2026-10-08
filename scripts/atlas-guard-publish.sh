@@ -28,7 +28,17 @@ if [ -n "$REC" ] && [ -n "$BWORK" ] && [ -n "$ATLAS_VAULT_REMOTE" ]; then
   if [ $((NOW - LAST)) -ge 30 ]; then
     printf '%s' "$NOW" > "$THROTTLE" 2>/dev/null || true
     CUR=$(git ls-remote "$ATLAS_VAULT_REMOTE" "refs/heads/$BWORK" 2>/dev/null | cut -f1 || true)
-    if [ -n "$CUR" ] && [ "$CUR" != "$REC" ]; then
+    # the seat's OWN push is not a foreign move (1.33.12, maths-practise +
+    # orchestrator: every both-hats vault push tripped this gate): quiet when CUR is
+    # already contained in any vault checkout this seat holds.
+    _OWN=0
+    for _wc in "$ATLAS_VAULT" "${ATLAS_LAUNCH_DIR:-}"/*/; do
+      [ -d "$_wc" ] && [ -f "${_wc%/}/registry/io-graph.yml" ] || continue
+      if git -C "${_wc%/}" cat-file -e "$CUR" 2>/dev/null &&          git -C "${_wc%/}" merge-base --is-ancestor "$CUR" HEAD 2>/dev/null; then
+        _OWN=1; break
+      fi
+    done
+    if [ -n "$CUR" ] && [ "$CUR" != "$REC" ] && [ "$_OWN" != 1 ]; then
       echo "Atlas: VAULT UPDATED — the work branch moved to ${CUR%????????????????????????????????} since your briefing was compiled from ${REC%????????????????????????????????}. Before finishing: run \`sh scripts/atlas-context.sh\`, read the fresh briefing (pins, ADRs, contracts or needs may have changed your task), reconcile your in-flight work against it, then finish." >&2
       exit 2
     fi
@@ -45,7 +55,7 @@ fi
 # never correct work. Checks changed .md files in the VAULT checkout before finish.
 PY=${PY:-$(command -v python3 || command -v python)}
 if [ -n "${ATLAS_VAULT:-}" ] && [ -d "$ATLAS_VAULT" ]; then
-  _BAD=$(cd "$ATLAS_VAULT" 2>/dev/null && git status --porcelain -uall 2>/dev/null |     awk '{print $2}' | grep -E '^(components/|needs/|architecture/).*\.md$' | while read -r _f; do
+  _BAD=$(cd "$ATLAS_VAULT" 2>/dev/null && git status --porcelain -uall 2>/dev/null |     awk '{print $2}' | grep -E '^(components/|needs/|architecture/|troubleshooting/).*\.md$' | while read -r _f; do
       [ -f "$_f" ] || continue
       "$PY" -c '
 import sys, re, yaml
