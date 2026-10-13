@@ -30,6 +30,11 @@ CONTRACTS = (
     "blocks-service-api-contract-v0_7.md",
     "blocks-service-api-contract-v0_8.md",
 )
+CORPUS_AMENDMENT = "blocks-service-uri-corpus-amendment-v0_1.md"
+# A proposed fixture may be present on the local Atlas branch before it merges.
+# Code CI also runs against vault dev, where that proposal is not yet published.
+if (PROVIDES / CORPUS_AMENDMENT).is_file():
+    CONTRACTS += (CORPUS_AMENDMENT,)
 
 #: The version the service currently generates. Older published contracts are
 #: immutable: their artefacts are the bytes consumers were handed, and a stale
