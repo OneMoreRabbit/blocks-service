@@ -23,6 +23,13 @@ the script expects caller-supplied `migrator_pw`, `app_pw`, `dispatcher_pw`,
 for this local database. The test administrator must have `CREATEDB`; the API
 role must not own tables or bypass row-level security.
 
+For local role setup, `tools/dev_db.py --roles-only` can apply that SQL when
+given an administrator DSN (`BLOCKS_ADMIN_DSN`) and explicit migrator, app,
+dispatcher, backup, and test-administrator passwords through its environment
+variables or command-line options. It does not create the database. The
+`--migrations-only` mode needs the administrator DSN and migrator password,
+but no other role password. Neither mode supplies password defaults.
+
 From the repository root, install the application and development dependencies,
 then edit `.env` to match your local database and chosen passwords:
 
@@ -37,6 +44,18 @@ The example uses `localhost:5432` and the database name `blocks`. Set
 `BLOCKS_DB_DISPATCHER_PASSWORD` in your untracked `.env` to the passwords you
 provisioned. The example values are placeholders and will not match a real
 database. Keep `.env` private.
+
+`tools/dev_db.py` reads process environment variables, not `.env` directly. If
+you use it to provision roles, supply your local `BLOCKS_ADMIN_DSN`,
+`BLOCKS_DB_BACKUP_PASSWORD`, and `BLOCKS_TEST_ADMIN_PASSWORD` from your own
+credential source, then export the `.env` values and run:
+
+```sh
+set -a
+. ./.env
+set +a
+.venv/bin/python tools/dev_db.py --roles-only
+```
 
 Apply the forward-only migrations with the migrator role, then start the API:
 
