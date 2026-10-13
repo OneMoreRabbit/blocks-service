@@ -12,9 +12,9 @@ from blocks_service.db import Database
 from blocks_service.project_items import InvalidItem, validate_uri
 
 
-CORPUS_PATH = pathlib.Path(__file__).parent / "project-resource-uri-validation-v0_4.json"
+CORPUS_PATH = pathlib.Path(__file__).parent / "project-resource-uri-validation-v0_5.json"
 CORPUS = json.loads(CORPUS_PATH.read_text())
-OWNER_LINK = CORPUS["accepted"][-1]
+SYNTHETIC_BROWSER_LINK = CORPUS["accepted"][-2]
 API_08 = {"X-Blocks-API-Version": "0.8"}
 
 
@@ -55,7 +55,7 @@ def _envelope(state: dict, ordered: list[str], operation_id: str | None = None) 
     }
 
 
-async def test_v04_uri_corpus_has_handler_database_and_route_parity(
+async def test_v05_uri_corpus_has_handler_database_and_route_parity(
     client, auth, db: Database,
 ):
     tenant, actor = await _tenant(client, auth), await _actor(client, auth)
@@ -64,11 +64,11 @@ async def test_v04_uri_corpus_has_handler_database_and_route_parity(
     created = await client.post(
         f"/v1/tenants/{tenant}/projects/{project['id']}/items/links",
         headers={**auth("alice"), "X-Blocks-API-Version": "0.8"},
-        json={"id": link_id, "title": "Owner link", "uri": OWNER_LINK,
+        json={"id": link_id, "title": "Synthetic browser link", "uri": SYNTHETIC_BROWSER_LINK,
               "operation_id": str(uuid.uuid4())},
     )
     assert created.status_code == 201, created.text
-    assert created.json()["uri"] == OWNER_LINK
+    assert created.json()["uri"] == SYNTHETIC_BROWSER_LINK
 
     def handler_accepts(value: str) -> bool:
         try:
@@ -91,7 +91,7 @@ async def test_v04_uri_corpus_has_handler_database_and_route_parity(
                 except psycopg.errors.CheckViolation:
                     assert not expected, value
 
-    assert validate_uri(OWNER_LINK, api_version="0.7") == OWNER_LINK
+    assert validate_uri(SYNTHETIC_BROWSER_LINK, api_version="0.7") == SYNTHETIC_BROWSER_LINK
 
 
 async def test_complete_note_order_replays_after_restart_and_emits_identifiers_only(
