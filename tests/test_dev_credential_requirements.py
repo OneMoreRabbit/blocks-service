@@ -72,21 +72,22 @@ class DevDbCredentialTests(unittest.TestCase):
         connect.assert_not_called()
 
     def test_missing_or_blank_admin_dsn_fails_before_db(self) -> None:
-        for value in (None, "", " \t "):
-            with self.subTest(value_present=value is not None):
-                env = dict(ROLE_CREDENTIALS)
-                if value is not None:
-                    env["BLOCKS_ADMIN_DSN"] = value
-                result, stderr, connect, migrate = self.call_tool([], env)
-                self.assertEqual(result, 2)
-                self.assertIn("BLOCKS_ADMIN_DSN", stderr)
-                connect.assert_not_called()
-                migrate.assert_not_called()
+        for mode in ([], ["--roles-only"]):
+            for value in (None, "", " \t "):
+                with self.subTest(mode=mode, value_present=value is not None):
+                    env = dict(ROLE_CREDENTIALS)
+                    if value is not None:
+                        env["BLOCKS_ADMIN_DSN"] = value
+                    result, stderr, connect, migrate = self.call_tool(mode, env)
+                    self.assertEqual(result, 2)
+                    self.assertIn("BLOCKS_ADMIN_DSN", stderr)
+                    connect.assert_not_called()
+                    migrate.assert_not_called()
 
     def test_migrations_only_rejects_missing_or_blank_migrator_before_db(self) -> None:
         for value in (None, "", "  \t  "):
             with self.subTest(value_present=value is not None):
-                env = {"BLOCKS_ADMIN_DSN": ADMIN_DSN}
+                env = {}
                 if value is not None:
                     env["BLOCKS_DB_MIGRATOR_PASSWORD"] = value
                 result, stderr, connect, migrate = self.call_tool(["--migrations-only"], env)
@@ -96,8 +97,7 @@ class DevDbCredentialTests(unittest.TestCase):
                 migrate.assert_not_called()
 
     def test_migrations_only_accepts_explicit_migrator_without_other_role_passwords(self) -> None:
-        env = {"BLOCKS_ADMIN_DSN": ADMIN_DSN,
-               "BLOCKS_DB_MIGRATOR_PASSWORD": ROLE_CREDENTIALS["BLOCKS_DB_MIGRATOR_PASSWORD"]}
+        env = {"BLOCKS_DB_MIGRATOR_PASSWORD": ROLE_CREDENTIALS["BLOCKS_DB_MIGRATOR_PASSWORD"]}
         result, stderr, connect, migrate = self.call_tool(["--migrations-only"], env)
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")

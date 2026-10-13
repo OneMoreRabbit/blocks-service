@@ -27,8 +27,8 @@ For local role setup, `tools/dev_db.py --roles-only` can apply that SQL when
 given an administrator DSN (`BLOCKS_ADMIN_DSN`) and explicit migrator, app,
 dispatcher, backup, and test-administrator passwords through its environment
 variables or command-line options. It does not create the database. The
-`--migrations-only` mode needs the administrator DSN and migrator password,
-but no other role password. Neither mode supplies password defaults.
+`--migrations-only` mode needs only the migrator password, with no
+administrator DSN or other role password. Neither mode supplies password defaults.
 
 From the repository root, install the application and development dependencies,
 then edit `.env` to match your local database and chosen passwords:

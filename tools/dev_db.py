@@ -51,7 +51,7 @@ def main() -> int:
     parser.add_argument(
         "--admin-dsn",
         default=os.environ.get("BLOCKS_ADMIN_DSN"),
-        help="superuser DSN; defaults to $BLOCKS_ADMIN_DSN",
+        help="administrator DSN for role bootstrap; defaults to $BLOCKS_ADMIN_DSN",
     )
     parser.add_argument("--migrator-password", default=os.environ.get("BLOCKS_DB_MIGRATOR_PASSWORD"))
     parser.add_argument("--app-password", default=os.environ.get("BLOCKS_DB_APP_PASSWORD"))
@@ -67,9 +67,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.admin_dsn or not args.admin_dsn.strip():
-        print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
-        return 2
+    if not args.migrations_only:
+        if not args.admin_dsn or not args.admin_dsn.strip():
+            print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
+            return 2
 
     required = [("BLOCKS_DB_MIGRATOR_PASSWORD (or --migrator-password)", args.migrator_password)]
     if not args.migrations_only:
