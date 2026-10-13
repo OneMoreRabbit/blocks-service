@@ -51,10 +51,13 @@ def main() -> int:
     parser.add_argument(
         "--admin-dsn",
         default=os.environ.get("BLOCKS_ADMIN_DSN"),
-        help="superuser DSN; defaults to $BLOCKS_ADMIN_DSN",
+        help="administrator DSN for role bootstrap; defaults to $BLOCKS_ADMIN_DSN",
     )
-    parser.add_argument("--migrator-password", default=os.environ.get("BLOCKS_DB_MIGRATOR_PASSWORD", "blocks-dev-migrator"))
-    parser.add_argument("--app-password", default=os.environ.get("BLOCKS_DB_APP_PASSWORD", "blocks-dev-app"))
+    parser.add_argument("--migrator-password", default=os.environ.get("BLOCKS_DB_MIGRATOR_PASSWORD"))
+    parser.add_argument("--app-password", default=os.environ.get("BLOCKS_DB_APP_PASSWORD"))
+    parser.add_argument("--dispatcher-password", default=os.environ.get("BLOCKS_DB_DISPATCHER_PASSWORD"))
+    parser.add_argument("--backup-password", default=os.environ.get("BLOCKS_DB_BACKUP_PASSWORD"))
+    parser.add_argument("--test-admin-password", default=os.environ.get("BLOCKS_TEST_ADMIN_PASSWORD"))
     parser.add_argument("--database", default=os.environ.get("BLOCKS_DB_NAME", "blocks"))
     parser.add_argument("--roles-only", action="store_true")
     parser.add_argument(
@@ -64,9 +67,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.admin_dsn:
-        print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
-        return 2
+    if not args.migrations_only:
+        if not args.admin_dsn or not args.admin_dsn.strip():
+            print("BLOCKS_ADMIN_DSN (or --admin-dsn) is required", file=sys.stderr)
+            return 2
+
+    required = [("BLOCKS_DB_MIGRATOR_PASSWORD (or --migrator-password)", args.migrator_password)]
+    if not args.migrations_only:
+        required.extend([
+            ("BLOCKS_DB_APP_PASSWORD (or --app-password)", args.app_password),
+            ("BLOCKS_DB_DISPATCHER_PASSWORD (or --dispatcher-password)", args.dispatcher_password),
+            ("BLOCKS_DB_BACKUP_PASSWORD (or --backup-password)", args.backup_password),
+            ("BLOCKS_TEST_ADMIN_PASSWORD (or --test-admin-password)", args.test_admin_password),
+        ])
+    for name, value in required:
+        if not value or not value.strip():
+            print(f"{name} is required", file=sys.stderr)
+            return 2
 
     if args.migrations_only:
         return _migrate(args)
@@ -76,6 +93,9 @@ def main() -> int:
         {
             "migrator_pw": args.migrator_password,
             "app_pw": args.app_password,
+            "dispatcher_pw": args.dispatcher_password,
+            "backup_pw": args.backup_password,
+            "test_admin_pw": args.test_admin_password,
             "db": args.database,
         },
     )

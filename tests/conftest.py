@@ -56,9 +56,16 @@ def _test_admin_dsn() -> str:
     return f"host={host} port={port} user=blocks_test_admin password={password} dbname=blocks"
 
 
+def _required_credential(name: str) -> str:
+    value = os.environ.get(name)
+    if not value or not value.strip():
+        raise RuntimeError(f"{name} is required for PostgreSQL tests")
+    return value
+
+
+MIGRATOR_PASSWORD = _required_credential("BLOCKS_DB_MIGRATOR_PASSWORD")
+APP_PASSWORD = _required_credential("BLOCKS_DB_APP_PASSWORD")
 ADMIN_DSN = _test_admin_dsn()
-MIGRATOR_PASSWORD = os.environ.get("BLOCKS_DB_MIGRATOR_PASSWORD", "blocks-dev-migrator")
-APP_PASSWORD = os.environ.get("BLOCKS_DB_APP_PASSWORD", "blocks-dev-app")
 DEV_SECRET = "test-signing-key-not-a-secret-32b+"
 
 

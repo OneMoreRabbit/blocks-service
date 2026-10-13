@@ -1,115 +1,114 @@
 # Blocks Service
 
-The authoritative domain, data, synchronization, and device-coordination service
-for Blocks. One component: API process, background worker, schema migrations, and
-outbox dispatcher share a domain model, a schema, and a release cadence.
+Blocks helps people keep projects, notes, links, and parked work in sync across
+devices. This repository contains the Service API, its PostgreSQL schema and
+migrations, and a background worker that dispatches change events. The Android
+app can work locally and sync with Service when connected. A Web client is
+planned; it is not a live product.
 
-**Architecture, contracts, plans, and decisions live in the Atlas-Blocks vault**,
-not in this repository — see `AGENTS.md`. Run `sh scripts/atlas-context.sh` for
-the current briefing.
+Service authenticates each request, maps the verified identity to a tenant,
+and uses PostgreSQL row-level security to keep tenants separate. Its API covers
+sessions and identity bootstrap, projects and their order, notes and links,
+parking, blocks and map operations, and a change feed for device sync. The
+running API describes its routes at `/docs` and `/openapi.json`.
 
-## Layout
+## Run locally
 
-| Path | What |
-|---|---|
-| `src/blocks_service/` | The service. `db.py` and `migrations/` are where tenant isolation actually lives. |
-| `migrations/` | Forward-only SQL, applied by `tools/migrate.py`. |
-| `contracts/events/` | Hand-authored event JSON Schemas — the published contract, validated against in tests. |
-| `tools/` | Migration runner, dev database bootstrap, contract export. |
-| `tests/` | Run against real PostgreSQL as the real unprivileged runtime role. |
+You need Python 3.12 or newer, a PostgreSQL server, and a database administrator
+who can create the `blocks` database and provision roles. This repository does
+not start PostgreSQL or create cluster roles for you. Provision the local roles
+from [`tools/bootstrap_roles.sql`](tools/bootstrap_roles.sql) before migrating;
+the script expects caller-supplied `migrator_pw`, `app_pw`, `dispatcher_pw`,
+`backup_pw`, `test_admin_pw`, and `db` psql variables. Use passwords you choose
+for this local database. The test administrator must have `CREATEDB`; the API
+role must not own tables or bypass row-level security.
 
-## Local setup
+For local role setup, `tools/dev_db.py --roles-only` can apply that SQL when
+given an administrator DSN (`BLOCKS_ADMIN_DSN`) and explicit migrator, app,
+dispatcher, backup, and test-administrator passwords through its environment
+variables or command-line options. It does not create the database. The
+`--migrations-only` mode needs only the migrator password, with no
+administrator DSN or other role password. Neither mode supplies password defaults.
 
-Requires the seat's platform PostgreSQL container (`postgres:5432`).
+From the repository root, install the application and development dependencies,
+then edit `.env` to match your local database and chosen passwords:
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
 cp .env.example .env
-.venv/bin/python -m pytest
 ```
 
-The harness connects as `blocks_test_admin` (CREATEDB, **not** a superuser) and
-reads its password from `~/.secrets/blocks_test_admin_password`, delivered
-seat-locally. Roles themselves are cluster-level and provisioned by the
-orchestrator from `tools/bootstrap_roles.sql`; a seat has no `CREATEROLE`, so use
-`tools/dev_db.py --migrations-only` to apply migrations alone.
+The example uses `localhost:5432` and the database name `blocks`. Set
+`BLOCKS_DB_APP_PASSWORD`, `BLOCKS_DB_MIGRATOR_PASSWORD`, and
+`BLOCKS_DB_DISPATCHER_PASSWORD` in your untracked `.env` to the passwords you
+provisioned. The example values are placeholders and will not match a real
+database. Keep `.env` private.
 
-Run it:
+`tools/dev_db.py` reads process environment variables, not `.env` directly. If
+you use it to provision roles, supply your local `BLOCKS_ADMIN_DSN`,
+`BLOCKS_DB_BACKUP_PASSWORD`, and `BLOCKS_TEST_ADMIN_PASSWORD` from your own
+credential source, then export the `.env` values and run:
 
 ```sh
+set -a
+. ./.env
+set +a
+.venv/bin/python tools/dev_db.py --roles-only
+```
+
+Apply the forward-only migrations with the migrator role, then start the API:
+
+```sh
+.venv/bin/python tools/migrate.py
 .venv/bin/python -m uvicorn --app-dir src --factory blocks_service.app:create_app --port 8080
 ```
 
-`GET /health/ready` reports `tenant_isolation: enforced` only if the connected
-role can neither bypass RLS nor own the tables.
-
-Run the worker (the outbox dispatcher):
+In another terminal, from the repository root, start the outbox worker:
 
 ```sh
-PYTHONPATH=src BLOCKS_DB_DISPATCHER_PASSWORD=blocks-dev-dispatcher \
-  .venv/bin/python -m blocks_service.dispatcher
+PYTHONPATH=src .venv/bin/python -m blocks_service.dispatcher
 ```
 
-Delivery is **at-least-once**: a batch is claimed, delivered and marked in one
-transaction, so a crash mid-batch redelivers rather than loses. Consumers
-deduplicate on `eventId`. The only sink today logs the envelope — no consumer
-exists yet, and a stub that pretended to deliver would be worse than one that
-says what it is.
+The API and worker read `.env` from the repository root. Check
+`http://localhost:8080/health/ready` for readiness. Business routes require a
+Bearer identity token; the example `BLOCKS_IDENTITY_MODE=dev` is for local
+development and tests only. A deployed Service must use a configured OIDC
+issuer. The worker currently logs dispatched event envelopes.
 
-## Backup and restore
+## Run tests
 
-`tools/restore_drill.py` dumps the database, restores it into a scratch copy, and
-verifies that **row-level security survived the round trip** — not just the rows.
-A restore that returns every row while silently losing RLS looks like a complete
-success and is a total tenant-isolation failure.
+The suite uses a real PostgreSQL database, creates and drops
+`blocks_service_test`, and connects as the unprivileged roles it tests. It does
+not use an in-memory database. Provision the development-only
+`blocks_test_admin` role from `tools/bootstrap_roles.sql` and supply its local
+DSN. Export the values in `.env` because the test harness reads the app and
+migrator passwords from process environment variables:
 
 ```sh
-.venv/bin/python tools/restore_drill.py --source-db blocks --scratch-db blocks_drill
+set -a
+. ./.env
+set +a
+export BLOCKS_TEST_ADMIN_DSN='host=localhost port=5432 dbname=blocks user=blocks_test_admin password=<your-local-test-admin-password>'
+.venv/bin/python -m pytest
 ```
 
-It needs `pg_dump`/`pg_restore` on `PATH` (not yet in the seat image) **and** a
-role that can bypass RLS. There is currently no such role reachable from a seat,
-so the drill's tests skip with a reason.
+Use an isolated local PostgreSQL instance for tests: the suite replaces the
+named test database. Do not point these commands at an existing shared or
+production database.
 
-That second requirement is not a quirk. `pg_dump` refuses to dump a table whose
-policies apply to the dumping role, because the alternative is a partial dump
-that looks complete. **Never silence that with `--enable-row-security`**:
-measured on this schema, it exits 0, `pg_restore` exits 0, and every
-tenant-scoped table comes back empty while the un-policied identity tables
-restore normally.
+## Repository map
 
-## The one thing to know before changing anything
+| Path | Contents |
+|---|---|
+| `src/blocks_service/` | API, domain model, database access, and worker |
+| `migrations/` | Forward-only PostgreSQL migrations |
+| `contracts/events/` | Event JSON Schemas |
+| `tools/` | Role-bootstrap SQL, migration runner, and contract tools |
+| `tests/` | API and database tests |
 
-Tenant isolation is enforced by PostgreSQL, not by this code. Every tenant-scoped
-table has `FORCE ROW LEVEL SECURITY` and a policy comparing `tenant_id` against
-a transaction-local setting; the service connects as `blocks_app`, which is
-neither an owner nor `BYPASSRLS`. Application queries therefore carry no tenant
-predicate — the absence of `where tenant_id = ...` in `repository.py` is the
-design, not an oversight.
+## License
 
-Two consequences:
-
-- Reach tenant data only through `Database.tenant_transaction`. An unscoped
-  connection sees zero rows, so a mistake fails closed and loudly.
-- Never grant the runtime role ownership, `SUPERUSER`, or `BYPASSRLS`. Any of
-  the three turns every policy in the schema into a comment.
-
-## Database roles
-
-Six, and the separation is load-bearing rather than ceremonial. `blocks_owner`
-owns the schema; `blocks_migrator` runs migrations under it; `blocks_app` is the
-API's runtime role; `blocks_dispatcher` may read every tenant's outbox rows and
-write exactly one column of them (ADR-0005); `blocks_backup` may read everything
-and write nothing; `blocks_test_admin` builds and tears down test databases.
-
-Only `blocks_backup` holds `BYPASSRLS`, because `pg_dump` cannot dump `FORCE`-RLS
-tables without it — and it is compensated by having no write grant anywhere. No
-role that serves requests or mutates data is exempt from the policies.
-`tools/bootstrap_roles.sql` is the one definition; the orchestrator applies it.
-
-## Not yet built
-
-Identity runs against a substituted verifier rather than a real OIDC issuer, the
-dispatcher has no retry or poison-message handling, and the domain is still
-projects only — no blocks, bindings, map, work sessions, or parking. See the
-development plan in the vault.
+No license has been supplied: this repository currently has no `LICENSE` or
+`COPYING` file. The owner still needs to choose and add a license; public
+visibility alone does not answer reuse terms.
