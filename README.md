@@ -3,14 +3,20 @@
 Blocks helps people keep projects, notes, links, and parked work in sync across
 devices. This repository contains the Service API, its PostgreSQL schema and
 migrations, and a background worker that dispatches change events. The Android
-app can work locally and sync with Service when connected. A Web client is
-planned; it is not a live product.
+app can work locally and sync with Service when connected.
 
 Service authenticates each request, maps the verified identity to a tenant,
 and uses PostgreSQL row-level security to keep tenants separate. Its API covers
 sessions and identity bootstrap, projects and their order, notes and links,
 parking, blocks and map operations, and a change feed for device sync. The
 running API describes its routes at `/docs` and `/openapi.json`.
+
+## Components
+
+- [Blocks Android](https://github.com/OneMoreRabbit/blocks-android) is the
+  local-first mobile app. It syncs with [Blocks Service](https://github.com/OneMoreRabbit/blocks-service)
+  when connected.
+- Blocks Web is a planned browser client; it is not live or public yet.
 
 ## Run locally
 
