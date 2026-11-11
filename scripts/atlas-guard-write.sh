@@ -23,7 +23,7 @@ ti = d.get("tool_input") or {}
 print(ti.get("file_path") or ti.get("notebook_path") or "")
 body = (ti.get("content") or ti.get("new_string") or "").replace("\r", "")
 import re
-m = re.search(r"^(?:to|addressed-to):\s*(.+)$", body, re.M)
+m = re.search(r"^(?:to|addressed-to|addressed_to):\s*(.+)$", body, re.M)
 print(m.group(1).strip() if m else "")
 ')
 P=$(printf '%s\n' "$_PL" | sed -n 1p)
@@ -161,12 +161,14 @@ try:
     _c = json.load(open(_os.path.expanduser("~/.atlas/directory.json")))
     for _e in (_c.get("addressable") or []):
         if isinstance(_e, dict):
-            if _e.get("fqn"):
-                _f = str(_e["fqn"]).lower()
-                ok.add(_f); ok.add(_f.split(".", 1)[1] if "." in _f else _f)
+            # contract addresses only (1.34.6) - FQNs and bot names are not; an arch seat
+            # with no component rows (the method seat) contributes its <project>.arch
             for _cm in _e.get("components") or []:
                 if isinstance(_cm, dict) and _cm.get("address"):
                     ok.add(str(_cm["address"]).lower())
+            _f = str(_e.get("fqn") or "").lower()
+            if _f.endswith(".arch") and not (_e.get("components") or []) and "." in _f:
+                ok.add(_f.split(".", 1)[1])
     have_dir = True
 except Exception:
     pass
@@ -215,6 +217,22 @@ case "$REL" in
   architecture/proposals/*) exit 0 ;;
   registry/io-graph.yml)    exit 0 ;;
 esac
+# extra outboxes declared for this seat's components (1.34.10; same rule as the CI guard)
+for _s in $(printf '%s\n' "$SLUGS" | sort -u); do
+  "$PY" - "$V/registry/io-graph.yml" "$_s" "$REL" <<'PYOB' && exit 0
+import sys
+try:
+    import yaml
+    g = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    sys.exit(1)
+for p in ((g.get("outboxes") or {}).get(sys.argv[2]) or []):
+    p = str(p).strip().lstrip("/")
+    if p and ".." not in p and sys.argv[3].startswith(p if p.endswith("/") else p + "/"):
+        sys.exit(0)
+sys.exit(1)
+PYOB
+done
 if [ "${ATLAS_ROLE:-component}" = "both" ]; then
   # the union is AS ARCH (1.33.12, maths-practise: architecture/* alone blocked
   # next-steps.md, roadmap.md and meta/ — required every arch session): everything in
