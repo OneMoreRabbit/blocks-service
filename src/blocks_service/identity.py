@@ -15,6 +15,7 @@ the real one. `Settings` refuses DevVerifier when BLOCKS_ENV=production.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -45,9 +46,9 @@ class IdentityVerifier(Protocol):
 
 
 class OidcVerifier:
-    def __init__(self, *, issuer: str, audience: str, jwks_url: str) -> None:
+    def __init__(self, *, issuer: str, audiences: Sequence[str], jwks_url: str) -> None:
         self._issuer = issuer
-        self._audience = audience
+        self._audiences = tuple(audiences)
         self._jwks = PyJWKClient(jwks_url, cache_keys=True)
 
     def verify(self, token: str) -> Principal:
@@ -58,7 +59,7 @@ class OidcVerifier:
                 key,
                 algorithms=["RS256", "ES256"],
                 issuer=self._issuer,
-                audience=self._audience,
+                audience=self._audiences,
                 options={"require": ["exp", "iat", "iss", "sub", "aud"]},
             )
         except Exception as exc:  # PyJWT raises a family; the caller needs one
@@ -121,7 +122,7 @@ def build_verifier(settings: Settings) -> IdentityVerifier:
     if settings.identity_mode is IdentityMode.oidc:
         return OidcVerifier(
             issuer=settings.oidc_issuer,
-            audience=settings.oidc_audience,
+            audiences=settings.accepted_oidc_audiences,
             jwks_url=settings.oidc_jwks_url,
         )
     return DevVerifier(secret=settings.dev_token_secret)
