@@ -48,7 +48,8 @@ echo "NEGATIVE CONTROL: current dev $OLD_HEAD must reject the second configured 
 old_dir=$(mktemp -d /tmp/blocks-service-uc04-old.XXXXXX)
 build_dir=$(mktemp -d /tmp/blocks-service-uc04-build.XXXXXX)
 full_log=$(mktemp /tmp/blocks-service-uc04-pytest.XXXXXX)
-trap 'rm -rf "$old_dir" "$build_dir" "$full_log"' EXIT HUP INT TERM
+full_xml=$(mktemp /tmp/blocks-service-uc04-junit.XXXXXX)
+trap 'rm -rf "$old_dir" "$build_dir" "$full_log" "$full_xml"' EXIT HUP INT TERM
 git archive "$OLD_HEAD" | tar -x -C "$old_dir"
 cp tests/test_web_audience_identity.py "$old_dir/test_web_audience_identity.py"
 echo 'COMMAND: run second-audience regression against archived current-dev source.'
@@ -72,14 +73,15 @@ test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.9.0-*.whl' 
 sha256sum "$build_dir"/wheels/*.whl
 
 echo 'FULL GATE: complete repository suite against the disposable PostgreSQL runner.'
-echo 'COMMAND: pytest -q'
-echo 'EXPECTED: all passed, zero skipped/xfailed/xpassed; no shared or production DB touched.'
-"$PYTHON" -m pytest -q | tee "$full_log"
-grep -Eq '[0-9]+ passed in ' "$full_log"
-if grep -Eq 'skipped|xfailed|xpassed' "$full_log"; then
-  echo 'FAIL: full gate had a non-passing outcome'
-  exit 1
+echo 'COMMAND: pytest -q -o xfail_strict=true --junitxml=<temporary report>'
+echo 'EXPECTED: process exit zero, JUnit tests > 0 and zero failures/errors/skips; strict XPASS fails. No shared or production DB touched.'
+if "$PYTHON" -m pytest -q -o xfail_strict=true --junitxml="$full_xml" > "$full_log" 2>&1; then
+  pytest_exit=0
+else
+  pytest_exit=$?
 fi
+cat "$full_log"
+"$PYTHON" scripts/check_uc04_pytest_result.py "$full_xml" "$pytest_exit"
 echo "SOURCE HEAD: $(git rev-parse HEAD)"
 echo 'CASES 1-5: pass only if all commands above passed.'
 echo 'CASE 6 PAUSE: provider-released Android/Web Google tokens and approved Web provisioning.'
