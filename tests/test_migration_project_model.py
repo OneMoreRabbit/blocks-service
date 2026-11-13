@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pathlib
 import os
+import time
 from collections.abc import Iterator
 
 import psycopg
@@ -34,6 +35,31 @@ ITEMS = EXPAND[6]         # 0013 — discrete project items
 INTERACTION = EXPAND[7]   # 0014 — ordered aggregates and Park tombstones
 NOTE_ORDER = EXPAND[8]    # 0015 — ordered Notes
 SCRATCH = "blocks_migration_drill"
+
+
+def _wait_for_scratch_connections(conn, timeout: float = 5.0) -> None:
+    """Wait for signalled scratch-db backends to exit before the admin drops it.
+
+    pg_terminate_backend(pid) without a timeout only sends a signal. The admin
+    cannot terminate a blocks_app backend, so dropping before it exits races
+    with that signal. Persistent sessions are a fixture error, not a reason to
+    broaden the admin role's privileges.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        sessions = conn.execute(
+            "select pid, usename from pg_stat_activity where datname = %s",
+            (SCRATCH,),
+        ).fetchall()
+        if not sessions:
+            return
+        if time.monotonic() >= deadline:
+            roles = sorted({str(role) for _, role in sessions})
+            raise AssertionError(
+                f"{SCRATCH} still has {len(sessions)} connection(s) after {timeout}s"
+                f" (roles: {roles})"
+            )
+        time.sleep(0.05)
 
 
 def _backup_dsn(dbname: str) -> str:
@@ -93,7 +119,8 @@ def legacy_db() -> Iterator[str]:
             (SCRATCH,),
         )
     with psycopg.connect(ADMIN_DSN, autocommit=True) as conn:
-        conn.execute(f'drop database if exists "{SCRATCH}" with (force)')
+        _wait_for_scratch_connections(conn)
+        conn.execute(f'drop database if exists "{SCRATCH}"')
 
 
 def _seed(conn) -> None:
