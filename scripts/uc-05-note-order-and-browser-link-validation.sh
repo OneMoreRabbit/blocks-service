@@ -102,9 +102,9 @@ echo 'EXPECTED: 7 passed with the read-only backup role and restored RLS/role bo
 .venv/bin/python -m pytest tests/test_restore_drill.py -q
 echo 'CASE 6 VERDICT: pass'
 
-echo 'BUILD — exactly one collision-free package 0.9.0 build in this run'
+echo 'BUILD — exactly one collision-free package 0.9.1 build in this run'
 echo 'COMMAND: archive exact HEAD and build one wheel in a clean directory'
-echo 'EXPECTED: one blocks_service-0.9.0 wheel is built locally; nothing is uploaded.'
+echo 'EXPECTED: one blocks_service-0.9.1 wheel is built locally; nothing is uploaded.'
 mkdir "$build_dir/source" "$build_dir/wheels"
 git archive HEAD | tar -x -C "$build_dir/source"
 (
@@ -112,8 +112,8 @@ git archive HEAD | tar -x -C "$build_dir/source"
   python3 -m pip wheel --no-deps --no-build-isolation \
     --wheel-dir "$build_dir/wheels" .
 )
-test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.9.0-*.whl' | wc -l)" -eq 1
-sha256sum "$build_dir"/wheels/blocks_service-0.9.0-*.whl
+test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.9.1-*.whl' | wc -l)" -eq 1
+sha256sum "$build_dir"/wheels/blocks_service-0.9.1-*.whl
 echo 'BUILD VERDICT: pass'
 
 echo 'FULL GATE — complete real-PostgreSQL repository suite, zero skips'
