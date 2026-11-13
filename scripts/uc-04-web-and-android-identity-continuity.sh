@@ -69,7 +69,7 @@ mkdir "$build_dir/source" "$build_dir/wheels"
 git archive HEAD | tar -x -C "$build_dir/source"
 (cd "$build_dir/source" && "$PYTHON" -m pip wheel --no-deps \
   --wheel-dir "$build_dir/wheels" .)
-test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.9.0-*.whl' | wc -l)" -eq 1
+test "$(find "$build_dir/wheels" -maxdepth 1 -name 'blocks_service-0.9.1-*.whl' | wc -l)" -eq 1
 sha256sum "$build_dir"/wheels/*.whl
 
 echo 'FULL GATE: complete repository suite against the disposable PostgreSQL runner.'
