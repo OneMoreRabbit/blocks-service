@@ -1,7 +1,7 @@
 ---
 title: Release notes — Blocks Service
 status: active
-updated: 2026-10-08
+updated: 2026-11-13
 owner: blocks.component.blocks-service
 about: one short entry per Service release tag, newest first
 ---
@@ -11,6 +11,17 @@ about: one short entry per Service release tag, newest first
 Newest first. These entries for tags through v0.9.0 were added when this repo adopted
 Atlas 1.34.0; those already-published tag commits cannot be changed. Future release
 entries belong in the commit that receives the tag.
+
+## v0.9.1 — 2026-11-13
+
+**TL;DR:** Release candidate adds a configured Web Google ID-token audience while keeping Android's existing audience and wire API 0.8.
+
+- A non-empty, exact audience list can admit Android and Web tokens under the same issuer and subject-to-tenant mapping; omitting it retains the existing single-audience setting.
+- Ambiguous, malformed or empty audience configuration fails before serving; signed-token and tenant checks remain required.
+- Concurrent first sign-in for one issuer and subject creates one user, personal tenant and membership.
+- The UC-04 companion checks complete test results from JUnit XML and preserves pytest's exit status.
+
+**Action:** No schema migration is needed. Release and deployment require separate approval; the dedicated Web audience must be provisioned alongside the existing Android audience before Web sign-in is enabled.
 
 ## v0.9.0 — 2026-10-08
 
