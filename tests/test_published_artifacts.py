@@ -122,7 +122,8 @@ def test_the_current_openapi_is_the_one_the_service_generates():
 
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
-            [sys.executable, "tools/export_contract.py", "--out", tmp],
+            [sys.executable, "tools/export_contract.py", "--out", tmp,
+             "--publication-version", "0.8"],
             check=True, capture_output=True,
         )
         regenerated = json.loads(
