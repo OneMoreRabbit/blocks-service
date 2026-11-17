@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from uuid import UUID, uuid4
 
@@ -236,3 +237,4 @@ async def test_twenty_project_measurement_prints_payload_plan_and_timing(
         f"{projected_ms:.2f} ms; SQL root {plan['Plan']['Node Type']} / "
         f"{plan['Execution Time']:.2f} ms"
     )
+    print("20-project Park SQL EXPLAIN JSON: " + json.dumps(plan, sort_keys=True))
