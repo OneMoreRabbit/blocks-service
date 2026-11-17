@@ -30,6 +30,31 @@ from blocks_service.config import Settings  # noqa: E402
 API_VERSION = "0.8"
 
 
+def _exclude_proposed_dashboard_summary(spec: dict) -> None:
+    """Keep the unactivated list projection out of frozen wire API 0.8."""
+    operation = spec["paths"]["/v1/tenants/{tenant_id}/projects"]["get"]
+    include = [
+        parameter for parameter in operation["parameters"]
+        if parameter["name"] == "include" and parameter["in"] == "query"
+    ]
+    if len(include) != 1:
+        raise RuntimeError("expected exactly one proposed Project-list include parameter")
+    operation["parameters"].remove(include[0])
+
+    response = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    alternatives = response.get("anyOf", [])
+    plain = [
+        option for option in alternatives
+        if option.get("items", {}).get("$ref") == "#/components/schemas/ProjectOut"
+        and option.get("type") == "array"
+    ]
+    if len(alternatives) != 2 or len(plain) != 1:
+        raise RuntimeError("expected proposed and original Project-list response shapes")
+    operation["responses"]["200"]["content"]["application/json"]["schema"] = {
+        **plain[0], "title": response["title"]
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=pathlib.Path)
@@ -40,6 +65,11 @@ def main() -> int:
     # the lifespan never runs.
     app = create_app(Settings(db_app_password="unused", dev_token_secret="unused-export-only"))
     spec = app.openapi()
+
+    # The candidate runtime accepts the optional projection for isolated
+    # tests. The accepted 0.8 contract must remain exactly the original list
+    # until publication/activation; the proposed exporter preserves full source.
+    _exclude_proposed_dashboard_summary(spec)
 
     # The 0.3 document describes the project model only. The service still SERVES
     # the retired 0.2 session and map routes through the declared compatibility
