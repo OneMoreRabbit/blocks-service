@@ -361,6 +361,35 @@ async def test_expired_newest_never_falls_back_to_older_explicit(client, auth):
     assert older["id"] not in snapshot.text and newer["id"] not in snapshot.text
 
 
+async def test_deleted_newest_keeps_revision_and_blocks_older_fallback(
+    client, auth, db
+):
+    tenant, actor_id = await _start(client, auth)
+    older = await _project(client, auth, tenant)
+    newer = await _project(client, auth, tenant)
+    auto, button = uuid4(), uuid4()
+    assert (
+        await _put(
+            client,
+            auth,
+            tenant,
+            auto,
+            _intent(older["id"], 1, kind="automatic_nfc"),
+        )
+    ).status_code == 200
+    assert (
+        await _put(client, auth, tenant, button, _intent(newer["id"], 1))
+    ).status_code == 200
+    async with db.tenant_transaction(UUID(tenant), UUID(actor_id)) as conn:
+        await conn.execute(
+            "delete from blocks.projects where tenant_id = %s and id = %s",
+            (tenant, newer["id"]),
+        )
+    snapshot = await _get(client, auth, tenant, source=auto)
+    assert snapshot.json() == {"current_revision": 2, "selection": None}
+    assert older["id"] not in snapshot.text and newer["id"] not in snapshot.text
+
+
 async def test_actor_tenant_rls_and_archived_target_do_not_leak(client, auth, db):
     tenant, alice_id = await _start(client, auth)
     other_tenant, bob_id = await _start(client, auth, "bob")

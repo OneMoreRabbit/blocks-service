@@ -49,7 +49,7 @@ create table blocks.follow_explicit (
   tenant_id        uuid        not null,
   user_id          uuid        not null,
   source_device_id uuid        not null,
-  project_id       uuid        not null,
+  project_id       uuid,
   revision         bigint      not null,
   accepted_at      timestamptz not null,
   expires_at       timestamptz not null,
@@ -57,7 +57,7 @@ create table blocks.follow_explicit (
   foreign key (tenant_id, user_id, source_device_id)
     references blocks.follow_sources (tenant_id, user_id, source_device_id) on delete cascade,
   foreign key (tenant_id, project_id)
-    references blocks.projects (tenant_id, id) on delete cascade
+    references blocks.projects (tenant_id, id) on delete set null (project_id)
 );
 
 -- Automatic NFC is scoped to one source chosen by the browser. A source
@@ -66,7 +66,7 @@ create table blocks.follow_automatic (
   tenant_id        uuid        not null,
   user_id          uuid        not null,
   source_device_id uuid        not null,
-  project_id       uuid        not null,
+  project_id       uuid,
   revision         bigint      not null,
   accepted_at      timestamptz not null,
   expires_at       timestamptz not null,
@@ -74,7 +74,7 @@ create table blocks.follow_automatic (
   foreign key (tenant_id, user_id, source_device_id)
     references blocks.follow_sources (tenant_id, user_id, source_device_id) on delete cascade,
   foreign key (tenant_id, project_id)
-    references blocks.projects (tenant_id, id) on delete cascade
+    references blocks.projects (tenant_id, id) on delete set null (project_id)
 );
 
 -- Tenant AND actor are required. A pooled connection with only a tenant
