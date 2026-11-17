@@ -6,6 +6,10 @@ import asyncio
 from datetime import datetime
 from uuid import UUID, uuid4
 
+import pytest
+
+from blocks_service import follow
+
 
 async def _start(client, auth, who="alice") -> tuple[str, str]:
     response = await client.post("/v1/session", headers=auth(who))
@@ -105,6 +109,39 @@ async def test_first_online_press_without_baseline_and_lost_reply_replay(
     async with db.tenant_transaction(UUID(tenant), UUID(actor_id)) as conn:
         cur = await conn.execute("select count(*) as n from blocks.outbox")
         assert (await cur.fetchone())["n"] == outbox_before
+
+
+async def test_refusal_unwinds_tenant_transaction_and_rolls_back(client, auth, db):
+    tenant, actor_id = await _start(client, auth)
+    project = await _project(client, auth, tenant)
+    source = uuid4()
+    # publish() inserts user state before checking age. The refusal must cross
+    # asynccontextmanager, roll that insert back, and return the pool connection.
+    with pytest.raises(follow.FollowRefusal) as refusal:
+        async with db.tenant_transaction(UUID(tenant), UUID(actor_id)) as conn:
+            await follow.publish(
+                conn,
+                tenant_id=UUID(tenant),
+                user_id=UUID(actor_id),
+                source_id=source,
+                sequence=1,
+                project_id=UUID(project["id"]),
+                kind="explicit_button",
+                dispatch_class="immediate",
+                observed_revision=None,
+                age_ms=10_000,
+            )
+    assert refusal.value.reason == "intent_expired"
+    async with db.tenant_transaction(UUID(tenant), UUID(actor_id)) as conn:
+        cur = await conn.execute(
+            "select count(*) as n from blocks.follow_user_state"
+            " where tenant_id = %s and user_id = %s",
+            (tenant, actor_id),
+        )
+        assert (await cur.fetchone())["n"] == 0
+    accepted = await _put(client, auth, tenant, source, _intent(project["id"], 1))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["revision"] == 1
 
 
 async def test_unsent_latest_sequence_and_late_a_cannot_roll_back(client, auth):

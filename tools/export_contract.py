@@ -47,16 +47,27 @@ def main() -> int:
     # them in the 0.3 contract would tell Android to generate against a surface
     # ADR-0009 retired. Excluded by tag, so a route cannot drift back in silently.
     legacy = {"sessions-0.2-legacy", "map-0.2-legacy"}
-    dropped = 0
+    # Follow is still a separate proposed surface. The running candidate serves
+    # it for isolated tests, but the accepted 0.8 artifact must describe only
+    # the active routes until the Follow contract is published.
+    proposed = {"follow"}
+    dropped_legacy = 0
+    dropped_proposed = 0
     for path in list(spec["paths"]):
         for method in list(spec["paths"][path]):
-            if legacy & set(spec["paths"][path][method].get("tags", [])):
+            tags = set(spec["paths"][path][method].get("tags", []))
+            if legacy & tags:
                 del spec["paths"][path][method]
-                dropped += 1
+                dropped_legacy += 1
+            elif proposed & tags:
+                del spec["paths"][path][method]
+                dropped_proposed += 1
         if not spec["paths"][path]:
             del spec["paths"][path]
-    if dropped:
-        print(f"  excluded {dropped} retired 0.2 operation(s) from the {API_VERSION} document")
+    if dropped_legacy:
+        print(f"  excluded {dropped_legacy} retired 0.2 operation(s) from the {API_VERSION} document")
+    if dropped_proposed:
+        print(f"  excluded {dropped_proposed} proposed Follow operation(s) from the {API_VERSION} document")
 
     # Prune schemas the surviving operations no longer reference, so the document
     # does not ship models for endpoints it does not describe.

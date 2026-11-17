@@ -13,7 +13,7 @@ LIFETIME_MS = 60_000
 SOURCE_LIMIT = 32
 
 
-@dataclass(frozen=True)
+@dataclass
 class FollowRefusal(Exception):
     status_code: int
     code: str
