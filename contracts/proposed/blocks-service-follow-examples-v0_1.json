@@ -1,0 +1,113 @@
+{
+  "proposal": "follow-selection-0.1",
+  "status": "proposed",
+  "notes": "Synthetic identities and Projects only; no active API 0.8 Follow route is claimed.",
+  "first_online_press": {
+    "method": "PUT",
+    "path": "/v1/tenants/00000000-0000-4000-8000-000000000001/follow/selection/00000000-0000-4000-8000-000000000101",
+    "body": {
+      "selection_sequence": 1,
+      "project_id": "00000000-0000-4000-8000-000000000201",
+      "intent_kind": "explicit_button",
+      "dispatch_class": "immediate",
+      "observed_revision": null,
+      "age_ms": 0
+    },
+    "status_code": 200,
+    "response": {
+      "revision": 1,
+      "accepted_at": "2026-01-01T10:00:00Z",
+      "expires_at": "2026-01-01T10:01:00Z",
+      "replayed": false,
+      "stream_status": "current"
+    }
+  },
+  "lost_response_replay_after_expiry": {
+    "body": {
+      "selection_sequence": 1,
+      "project_id": "00000000-0000-4000-8000-000000000201",
+      "intent_kind": "explicit_button",
+      "dispatch_class": "immediate",
+      "observed_revision": null,
+      "age_ms": 61000
+    },
+    "status_code": 200,
+    "response": {
+      "revision": 1,
+      "accepted_at": "2026-01-01T10:00:00Z",
+      "expires_at": "2026-01-01T10:01:00Z",
+      "replayed": true,
+      "stream_status": "expired"
+    }
+  },
+  "browser_snapshot": {
+    "method": "GET",
+    "path": "/v1/tenants/00000000-0000-4000-8000-000000000001/follow/selection",
+    "response": {
+      "current_revision": 1,
+      "selection": {
+        "revision": 1,
+        "source_device_id": "00000000-0000-4000-8000-000000000101",
+        "intent_kind": "explicit_button",
+        "project_id": "00000000-0000-4000-8000-000000000201",
+        "accepted_at": "2026-01-01T10:00:00Z",
+        "expires_at": "2026-01-01T10:01:00Z"
+      }
+    },
+    "cache_control": "private, no-store"
+  },
+  "inaccessible_target_snapshot": {
+    "status_code": 200,
+    "response": {"current_revision": 1, "selection": null},
+    "note": "No target/source fields and no fallback to an older hint."
+  },
+  "deferred_stale_candidate": {
+    "status_code": 409,
+    "response": {
+      "error": {
+        "code": "conflict",
+        "message": "The selection changed after this action.",
+        "reason": "stale_candidate",
+        "retryable": false,
+        "delivery": "not_accepted",
+        "current_revision": 4
+      }
+    }
+  },
+  "expired_new_intent": {
+    "status_code": 400,
+    "response": {
+      "error": {
+        "code": "invalid_request",
+        "message": "The original action is too old for a new signal.",
+        "reason": "intent_expired",
+        "retryable": false,
+        "delivery": "not_accepted"
+      }
+    }
+  },
+  "lower_sequence_after_newer_action": {
+    "status_code": 409,
+    "response": {
+      "error": {
+        "code": "conflict",
+        "message": "An accepted higher sequence already exists for this source.",
+        "reason": "stale_sequence",
+        "retryable": false
+      }
+    },
+    "note": "No delivery field: the earlier sequence may have committed before the newer action."
+  },
+  "source_limit": {
+    "status_code": 409,
+    "response": {
+      "error": {
+        "code": "conflict",
+        "message": "This account has reached the Follow source limit.",
+        "reason": "source_limit_reached",
+        "retryable": false,
+        "delivery": "not_accepted"
+      }
+    }
+  }
+}
