@@ -16,16 +16,22 @@ from .api import (
     changes,
     health,
     interaction,
-    map as map_api,
     project_items,
     project_model,
     session,
     sessions,
 )
+from .api import (
+    follow as follow_api,
+)
+from .api import (
+    map as map_api,
+)
 from .api.deps import require_supported_client
 from .config import Settings, get_settings
-from .errors import ErrorCode
 from .db import Database
+from .errors import ErrorCode
+from .follow import FollowRefusal
 from .identity import build_verifier
 
 
@@ -54,6 +60,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         summary="Authoritative domain, tenancy, and device-coordination API for Blocks.",
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def _follow_no_store(request: Request, call_next):
+        response = await call_next(request)
+        if "/follow/selection" in request.url.path:
+            response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.exception_handler(FollowRefusal)
+    async def _follow_refusal(request: Request, exc: FollowRefusal) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content=exc.body())
 
     @app.exception_handler(StarletteHTTPException)
     async def _error_envelope(request: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -99,6 +116,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # superset of 0.2's, so an installed 0.2 client keeps working through the
     # declared compatibility window (ADR-0009).
     app.include_router(project_model.router, dependencies=gated)
+    app.include_router(follow_api.router, dependencies=gated)
     app.include_router(project_items.router, dependencies=gated)
     app.include_router(interaction.router, dependencies=gated)
     app.include_router(blocks.router, dependencies=gated)
@@ -202,6 +220,22 @@ def _finalise_openapi(app: FastAPI, settings: Settings) -> None:
                 responses = operation.get("responses", {})
                 if responses.pop("422", None) is not None:
                     responses["400"] = {**error_ref, "description": "Malformed request"}
+        # Follow's new route also returns structured 400 age refusals inside
+        # the existing Error envelope. Keep its more precise declared shape;
+        # the generic 422-to-400 rewrite above must not erase it.
+        follow_put = schema.get("paths", {}).get(
+            "/v1/tenants/{tenant_id}/follow/selection/{source_device_id}", {}
+        ).get("put")
+        if follow_put:
+            follow_put["responses"]["400"] = {
+                "description": "Invalid or expired intent",
+                "content": {"application/json": {
+                    "schema": {"anyOf": [
+                        {"$ref": "#/components/schemas/Error"},
+                        {"$ref": "#/components/schemas/FollowRefusalOut"},
+                    ]}
+                }},
+            }
         # Authentication. Bearer everywhere except the probes; `/v1/session`
         # included, since it is where an identity token is exchanged, not where
         # one becomes unnecessary.
