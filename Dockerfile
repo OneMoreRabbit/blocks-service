@@ -6,24 +6,22 @@
 # never been built and that no deployment contract was active; both stopped being
 # true some time ago.
 #
-# `blocks-deployment` **0.5 is the active contract** (accepted 2026-09-14). 0.4 is
-# superseded as a contract and remains the estate's **current runtime description**
-# -- it is what the running stack matches, which is why it is not merely history.
-#
-# Acceptance is not deployment: the estate's development-tagged image is unchanged
-# until the separate cutover act, and nothing here authorises one.
+# The current deployment contract and release authority live in Atlas-Blocks.
 
-FROM python:3.12-slim AS build
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS build
 
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /build
 
 COPY pyproject.toml ./
+COPY requirements-release.txt ./
 COPY src/ ./src/
 RUN python -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir .
+ && /opt/venv/bin/pip install --no-cache-dir -r requirements-release.txt \
+ && /opt/venv/bin/pip install --no-cache-dir --no-deps . \
+ && /opt/venv/bin/pip check
 
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS runtime
 
 # Unprivileged, no shell, no home. The application never needs to write to its
 # own filesystem: all state is in PostgreSQL.

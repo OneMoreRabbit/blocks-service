@@ -1,7 +1,7 @@
 ---
 title: Release notes — Blocks Service
 status: active
-updated: 2026-11-13
+updated: 2026-11-18
 owner: blocks.component.blocks-service
 about: one short entry per Service release tag, newest first
 ---
@@ -11,6 +11,16 @@ about: one short entry per Service release tag, newest first
 Newest first. These entries for tags through v0.9.0 were added when this repo adopted
 Atlas 1.34.0; those already-published tag commits cannot be changed. Future release
 entries belong in the commit that receives the tag.
+
+## v0.9.2 — 2026-11-18
+
+**TL;DR:** Adds an optional newest-Park summary to the Project list for Web Dashboard cards.
+
+- `include=newest_parking_summary` returns the latest live Park's three answers for each listed Project; omitting it preserves the existing list response.
+- The API publication manifest is 0.10; wire API negotiation remains 0.8. Existing Android consumption remains on its reviewed pin.
+- The release image pins its Python 3.12 base by digest and installs exact runtime package versions from the passing isolated test runner's dependency set.
+
+**Action:** No schema migration is needed. Review the final tagged build and isolated PostgreSQL gate before estate deployment; Web's 0.10 pin and live read remain separately coordinated.
 
 ## v0.9.1 — 2026-11-13
 
