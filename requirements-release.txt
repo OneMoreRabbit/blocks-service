@@ -1,0 +1,31 @@
+# Python 3.12 amd64 runtime closure from the passing PR #12 estate runner manifest.
+# Source SHA-256: 940ae76a490dc9432b157c596f054ae067bf5a91ff4f1d860c11d89a8559b4de
+# Test tools and the local blocks-service file reference are excluded.
+annotated-doc==0.0.6
+annotated-types==0.8.0
+anyio==4.16.0
+cffi==2.1.1
+click==8.5.1
+cryptography==50.0.2
+fastapi==0.163.1
+h11==0.16.0
+httptools==0.9.0
+idna==3.20
+opentelemetry-api==1.45.2
+psycopg==3.3.9
+psycopg-binary==3.3.9
+psycopg-pool==3.3.3
+pycparser==3.12
+pydantic==2.14.3
+pydantic-settings==2.16.3
+pydantic_core==2.50.4
+PyJWT==2.15.1
+python-dotenv==1.2.4
+PyYAML==6.0.3
+starlette==1.10.0
+typing-inspection==0.4.5
+typing_extensions==4.16.0
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.4
