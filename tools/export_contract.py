@@ -7,10 +7,12 @@ The event schemas are hand-authored in contracts/events/ -- they are the source
 the code is validated against, not an output -- and are copied unchanged.
 
   python tools/export_contract.py --out <dir>
+  python tools/export_contract.py --out <dir> --publication-version 0.8
 
 `--out` is normally a component's provides/ folder in the Atlas vault, which is
 where clients read it: the point of publishing artefacts is that a client repo
-never needs this repo's source.
+never needs this repo's source. The default output is the proposed successor
+manifest 0.10; the explicit 0.8 mode verifies frozen historical bytes.
 """
 
 from __future__ import annotations
@@ -27,7 +29,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from blocks_service.app import create_app  # noqa: E402
 from blocks_service.config import Settings  # noqa: E402
 
-API_VERSION = "0.8"
+WIRE_API_VERSION = "0.8"
+PUBLICATION_VERSION = "0.10"
 
 
 def _exclude_proposed_dashboard_summary(spec: dict) -> None:
@@ -58,6 +61,11 @@ def _exclude_proposed_dashboard_summary(spec: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--publication-version", choices=(WIRE_API_VERSION, PUBLICATION_VERSION),
+        default=PUBLICATION_VERSION,
+        help="0.10 describes the enabled Park projection; 0.8 verifies frozen bytes",
+    )
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -66,10 +74,10 @@ def main() -> int:
     app = create_app(Settings(db_app_password="unused", dev_token_secret="unused-export-only"))
     spec = app.openapi()
 
-    # The candidate runtime accepts the optional projection for isolated
-    # tests. The accepted 0.8 contract must remain exactly the original list
-    # until publication/activation; the proposed exporter preserves full source.
-    _exclude_proposed_dashboard_summary(spec)
+    # The default export describes the enabled runtime. The explicit historical
+    # mode verifies frozen 0.8 bytes without rewriting that accepted artifact.
+    if args.publication_version == WIRE_API_VERSION:
+        _exclude_proposed_dashboard_summary(spec)
 
     # The 0.3 document describes the project model only. The service still SERVES
     # the retired 0.2 session and map routes through the declared compatibility
@@ -86,7 +94,7 @@ def main() -> int:
         if not spec["paths"][path]:
             del spec["paths"][path]
     if dropped:
-        print(f"  excluded {dropped} retired 0.2 operation(s) from the {API_VERSION} document")
+        print(f"  excluded {dropped} retired 0.2 operation(s) from the {args.publication_version} document")
 
     # Prune schemas the surviving operations no longer reference, so the document
     # does not ship models for endpoints it does not describe.
@@ -113,7 +121,7 @@ def main() -> int:
         if name not in referenced:
             del spec["components"]["schemas"][name]
 
-    openapi_path = args.out / f"blocks-service-api-openapi-v{API_VERSION.replace('.', '_')}.json"
+    openapi_path = args.out / f"blocks-service-api-openapi-v{args.publication_version.replace('.', '_')}.json"
     openapi_path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
     print(f"  wrote  {openapi_path.name}  ({len(spec['paths'])} paths)")
 

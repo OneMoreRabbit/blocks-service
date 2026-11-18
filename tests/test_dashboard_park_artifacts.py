@@ -1,7 +1,8 @@
-"""Keep the unactivated Park projection out of frozen wire API 0.8."""
+"""Describe the enabled Park projection while preserving frozen API 0.8."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import subprocess
@@ -31,9 +32,12 @@ def test_proposed_park_openapi_matches_candidate_source(tmp_path):
     assert any(parameter["name"] == "include" for parameter in operation["parameters"])
 
 
-def test_active_wire_export_omits_proposed_park_shape(tmp_path):
+def test_frozen_0_8_export_omits_park_shape(tmp_path):
     subprocess.run(
-        [sys.executable, "tools/export_contract.py", "--out", str(tmp_path)],
+        [
+            sys.executable, "tools/export_contract.py", "--out", str(tmp_path),
+            "--publication-version", "0.8",
+        ],
         check=True,
         capture_output=True,
     )
@@ -49,3 +53,22 @@ def test_active_wire_export_omits_proposed_park_shape(tmp_path):
     }
     assert "NewestParkingSummaryOut" not in active["components"]["schemas"]
     assert "ProjectWithParkSummaryOut" not in active["components"]["schemas"]
+
+
+def test_default_export_describes_enabled_park_and_only_park(tmp_path):
+    subprocess.run(
+        [sys.executable, "tools/export_contract.py", "--out", str(tmp_path)],
+        check=True,
+        capture_output=True,
+    )
+    artifact = tmp_path / "blocks-service-api-openapi-v0_10.json"
+    spec = json.loads(artifact.read_text())
+    operation = spec["paths"][PATH]["get"]
+    assert any(parameter["name"] == "include" for parameter in operation["parameters"])
+    assert {"NewestParkingSummaryOut", "ProjectWithParkSummaryOut"} <= set(
+        spec["components"]["schemas"]
+    )
+    assert not any("follow" in path.lower() for path in spec["paths"])
+    assert hashlib.sha256(artifact.read_bytes()).hexdigest() == (
+        "6b42b3f77fb32a125d52f5df9e9c6e393674b941f5c5feeac239a2771c6131b7"
+    )

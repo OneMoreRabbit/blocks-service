@@ -1,0 +1,66 @@
+{
+  "contract": "blocks-service-api",
+  "invalid_include": {
+    "body": {
+      "error": {
+        "code": "invalid_request",
+        "message": "Unsupported include value"
+      }
+    },
+    "request": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active&include=unknown",
+    "status": 400
+  },
+  "request_with_include": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active&include=newest_parking_summary",
+  "request_without_include": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active",
+  "response_with_include": [
+    {
+      "archived_at": null,
+      "client_id": null,
+      "created_at": "2026-01-01T10:00:00Z",
+      "id": "00000000-0000-4000-8000-000000000011",
+      "name": "Example project",
+      "navigation_key": null,
+      "newest_parking_summary": {
+        "id": "00000000-0000-4000-8000-000000000021",
+        "must_not_forget": "Bring the sample key",
+        "next_physical_action": "Check the sample card",
+        "occurred_at": "2026-01-01T10:05:00Z",
+        "where_i_am": "At the example desk"
+      },
+      "row_version": 1,
+      "status": "active",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "updated_at": "2026-01-01T10:00:00Z"
+    },
+    {
+      "archived_at": null,
+      "client_id": null,
+      "created_at": "2026-01-01T09:00:00Z",
+      "id": "00000000-0000-4000-8000-000000000012",
+      "name": "Empty example project",
+      "navigation_key": null,
+      "newest_parking_summary": null,
+      "row_version": 1,
+      "status": "active",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "updated_at": "2026-01-01T09:00:00Z"
+    }
+  ],
+  "response_without_include": [
+    {
+      "archived_at": null,
+      "client_id": null,
+      "created_at": "2026-01-01T10:00:00Z",
+      "id": "00000000-0000-4000-8000-000000000011",
+      "name": "Example project",
+      "navigation_key": null,
+      "row_version": 1,
+      "status": "active",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "updated_at": "2026-01-01T10:00:00Z"
+    }
+  ],
+  "status": "proposed",
+  "version": "0.10",
+  "wire_api": "0.8"
+}
