@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -109,6 +109,18 @@ class ProjectOut(BaseModel):
     )
 
 
+class NewestParkingSummaryOut(BaseModel):
+    id: UUID
+    occurred_at: datetime
+    where_i_am: str = Field(min_length=1, max_length=2000)
+    next_physical_action: str = Field(min_length=1, max_length=2000)
+    must_not_forget: str = Field(min_length=1, max_length=2000)
+
+
+class ProjectWithParkSummaryOut(ProjectOut):
+    newest_parking_summary: NewestParkingSummaryOut | None
+
+
 class NotesIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     body: str = Field(max_length=100_000, description="May be empty. Saved explicitly.")
@@ -191,18 +203,31 @@ class ProjectPageOut(BaseModel):
 
 @router.get(
     "",
-    response_model=list[ProjectOut],
+    response_model=list[ProjectWithParkSummaryOut] | list[ProjectOut],
     responses=errors.error_responses(400, 401, 403, 426),
     summary="The dashboard — active projects, or archived on request",
 )
 async def list_projects(
+    request: Request,
     ctx: TenantContext = Depends(tenant_context),
     status_filter: Literal["active", "archived"] = Query(
         "active", alias="status",
         description="`active` is the dashboard. `archived` is the separate Archive section.",
     ),
-) -> list[ProjectOut]:
-    return [ProjectOut(**row) for row in await pm.list_projects(ctx.conn, status_filter)]
+    include: str | None = Query(
+        None, description="Only newest_parking_summary is supported; omit for the unchanged list."
+    ),
+) -> list[ProjectOut] | list[ProjectWithParkSummaryOut]:
+    include_values = request.query_params.getlist("include")
+    if include_values and include_values != ["newest_parking_summary"]:
+        raise HTTPException(status_code=400, detail="Unsupported or repeated include value")
+    with_summary = include == "newest_parking_summary"
+    rows = await pm.list_projects(
+        ctx.conn, status_filter, include_newest_parking_summary=with_summary
+    )
+    if with_summary:
+        return [ProjectWithParkSummaryOut(**row) for row in rows]
+    return [ProjectOut(**row) for row in rows]
 
 
 @router.post(

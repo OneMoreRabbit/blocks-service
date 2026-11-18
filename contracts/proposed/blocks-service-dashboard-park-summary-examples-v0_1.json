@@ -1,0 +1,59 @@
+{
+  "status": "proposed",
+  "version": "0.1",
+  "request_without_include": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active",
+  "response_without_include": [
+    {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "client_id": null,
+      "name": "Example project",
+      "status": "active",
+      "row_version": 1,
+      "created_at": "2026-01-01T10:00:00Z",
+      "updated_at": "2026-01-01T10:00:00Z",
+      "archived_at": null,
+      "navigation_key": null
+    }
+  ],
+  "request_with_include": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active&include=newest_parking_summary",
+  "response_with_include": [
+    {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "client_id": null,
+      "name": "Example project",
+      "status": "active",
+      "row_version": 1,
+      "created_at": "2026-01-01T10:00:00Z",
+      "updated_at": "2026-01-01T10:00:00Z",
+      "archived_at": null,
+      "navigation_key": null,
+      "newest_parking_summary": {
+        "id": "00000000-0000-4000-8000-000000000021",
+        "occurred_at": "2026-01-01T10:05:00Z",
+        "where_i_am": "At the example desk",
+        "next_physical_action": "Check the sample card",
+        "must_not_forget": "Bring the sample key"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000012",
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "client_id": null,
+      "name": "Empty example project",
+      "status": "active",
+      "row_version": 1,
+      "created_at": "2026-01-01T09:00:00Z",
+      "updated_at": "2026-01-01T09:00:00Z",
+      "archived_at": null,
+      "navigation_key": null,
+      "newest_parking_summary": null
+    }
+  ],
+  "invalid_include": {
+    "request": "GET /v1/tenants/00000000-0000-4000-8000-000000000001/projects?status=active&include=unknown",
+    "status": 400,
+    "body": {"error": {"code": "invalid_request", "message": "Unsupported include value"}}
+  }
+}

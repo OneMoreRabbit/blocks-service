@@ -49,8 +49,58 @@ PROJECT_COLUMNS = (
 )
 
 
-async def list_projects(conn: psycopg.AsyncConnection, status: str = "active") -> list[dict]:
+async def list_projects(
+    conn: psycopg.AsyncConnection,
+    status: str = "active",
+    *,
+    include_newest_parking_summary: bool = False,
+) -> list[dict]:
     """The dashboard. Active by default; archived is a separate, deliberate ask."""
+    if include_newest_parking_summary:
+        # A lateral lookup is one statement for the entire list, regardless of
+        # card count. Its live/supersession/authored-order rule matches the page.
+        columns = (
+            "projects.id, projects.tenant_id, projects.client_id, projects.name,"
+            " projects.status::text as status, projects.row_version, projects.created_at,"
+            " projects.updated_at, projects.archived_at,"
+            " (select a.project_key from blocks.project_navigation_aliases a"
+            "   where a.project_id = projects.id) as navigation_key,"
+            " case when park.id is null then null else jsonb_build_object("
+            "   'id', park.id, 'occurred_at', park.occurred_at,"
+            "   'where_i_am', park.where_i_am,"
+            "   'next_physical_action', park.next_physical_action,"
+            "   'must_not_forget', park.must_not_forget)"
+            " end as newest_parking_summary"
+        )
+        join = (
+            " left join lateral ("
+            "   select p.id, p.occurred_at, p.where_i_am, p.next_physical_action,"
+            "          p.must_not_forget"
+            "   from blocks.parking_records p"
+            "   where p.tenant_id = projects.tenant_id and p.project_id = projects.id"
+            "     and p.deleted_at is null"
+            "     and not exists (select 1 from blocks.parking_records s"
+            "       where s.tenant_id = p.tenant_id and s.project_id = p.project_id"
+            "         and s.supersedes_id = p.id)"
+            "   order by p.occurred_at desc, p.created_at desc, p.id desc limit 1"
+            " ) park on true"
+        )
+        if status == "active":
+            cur = await conn.execute(
+                f"select {columns} from blocks.projects"
+                " join blocks.project_order_positions o"
+                "   on o.tenant_id = projects.tenant_id and o.project_id = projects.id"
+                f"{join} where projects.status = 'active'::blocks.project_status"
+                " order by o.position"
+            )
+        else:
+            cur = await conn.execute(
+                f"select {columns} from blocks.projects{join}"
+                " where projects.status = %s::blocks.project_status"
+                " order by projects.created_at desc",
+                (status,),
+            )
+        return list(await cur.fetchall())
     if status == "active":
         cur = await conn.execute(
             "select projects.id, projects.tenant_id, projects.client_id, projects.name,"
