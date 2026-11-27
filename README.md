@@ -16,7 +16,9 @@ running API describes its routes at `/docs` and `/openapi.json`.
 - [Blocks Android](https://github.com/OneMoreRabbit/blocks-android) is the
   local-first mobile app. It syncs with [Blocks Service](https://github.com/OneMoreRabbit/blocks-service)
   when connected.
-- Blocks Web is a planned browser client; it is not live or public yet.
+- Blocks Web is a separate browser client. Architecture reported its v0.2.0
+  production deployment on 19 November 2026; its release and operation are
+  managed separately from this repository.
 
 ## Run locally
 
